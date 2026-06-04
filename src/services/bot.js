@@ -2,6 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const Job = require('../models/Job');
 const PollResponse = require('../models/PollResponse');
 const Group = require('../models/Group');
+const Reminder = require('../models/Reminder');
 const { extractJobDetails } = require('./ai');
 const logger = require('../utils/logger');
 
@@ -169,6 +170,174 @@ async function findJobByRef(chatId, jobRef, statusFilter = {}) {
   return null;
 }
 
+function formatSettingState(enabled) {
+  return enabled ? 'ON' : 'OFF';
+}
+
+async function sendSettingsSummary(chatId, group) {
+  const settings = group.settings || {};
+  const response = `<b>Group Settings</b>
+
+Auto job detection: <b>${formatSettingState(settings.autoPollEnabled !== false)}</b>
+DM reminders: <b>${formatSettingState(settings.dmRemindersEnabled !== false)}</b>
+
+Use <code>/autopoll on</code> or <code>/autopoll off</code>
+Use <code>/dmreminders on</code> or <code>/dmreminders off</code>`;
+
+  await bot.sendMessage(chatId, response, { parse_mode: 'HTML' });
+}
+
+function parseToggleValue(value) {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  if (['on', 'enable', 'enabled', 'true', 'yes'].includes(normalized)) return true;
+  if (['off', 'disable', 'disabled', 'false', 'no'].includes(normalized)) return false;
+  return null;
+}
+
+async function getPendingReminderTargets(chatId, job) {
+  const group = await Group.findOne({ telegramGroupId: chatId });
+  if (!group) {
+    return { group: null, targetUsers: [] };
+  }
+
+  const responses = await PollResponse.find({ jobId: job._id });
+  const yesVotedUserIds = new Set(responses.filter(r => r.response === 'yes').map(r => r.userId));
+  const targetUsers = group.members.filter(member => !yesVotedUserIds.has(member.userId));
+
+  return { group, targetUsers };
+}
+
+function buildManualReminderMessage(job) {
+  const meta = getOpportunityMeta(job);
+  const deadlineFormatted = job.deadline ? new Date(job.deadline).toLocaleString('en-IN', {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit'
+  }) : 'No deadline specified';
+
+  return `🔔 <b>Manual ${escapeHTML(meta.singular)} Reminder</b>
+
+<b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)}
+📅 <b>${escapeHTML(meta.deadlineLabel)}:</b> ${escapeHTML(deadlineFormatted)}
+
+Please update the poll after ${escapeHTML(meta.reminderAction)}ing.`;
+}
+
+function buildJobActionKeyboard(job) {
+  const meta = getOpportunityMeta(job);
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: `🔗 ${meta.linkText.replace(' Here', ' Now')}`, url: job.applyLink }
+      ]
+    ]
+  };
+
+  if (String(job.telegramGroupId).startsWith('-100')) {
+    const cleanGroupId = String(job.telegramGroupId).replace('-100', '');
+    const pollLink = `https://t.me/c/${cleanGroupId}/${job.telegramMessageId}`;
+    keyboard.inline_keyboard[0].push({ text: '💬 View Poll', url: pollLink });
+  }
+
+  return keyboard;
+}
+
+function getOpportunityType(item) {
+  return item && ['job', 'hackathon', 'competition'].includes(item.opportunityType)
+    ? item.opportunityType
+    : 'job';
+}
+
+function getOpportunityMeta(item) {
+  const type = getOpportunityType(item);
+  const meta = {
+    job: {
+      singular: 'Job',
+      plural: 'Jobs',
+      listTitle: 'Active Job Opportunities',
+      companyLabel: 'Company',
+      roleLabel: 'Role',
+      linkText: 'Apply Here',
+      deadlineLabel: 'Deadline',
+      pollQuestion: 'Have you applied for',
+      yesLabel: 'Applied',
+      noLabel: 'Not Applied',
+      pendingTitle: 'Pending Applicants',
+      reminderAction: 'apply',
+      cardIcon: '📢'
+    },
+    hackathon: {
+      singular: 'Hackathon',
+      plural: 'Hackathons',
+      listTitle: 'Active Hackathons',
+      companyLabel: 'Organizer',
+      roleLabel: 'Event',
+      linkText: 'Register Here',
+      deadlineLabel: 'Registration Deadline',
+      pollQuestion: 'Have you registered for',
+      yesLabel: 'Registered',
+      noLabel: 'Not Registered',
+      pendingTitle: 'Pending Registrations',
+      reminderAction: 'register',
+      cardIcon: '🛠️'
+    },
+    competition: {
+      singular: 'Competition',
+      plural: 'Competitions',
+      listTitle: 'Active Competitions',
+      companyLabel: 'Organizer',
+      roleLabel: 'Event',
+      linkText: 'Register Here',
+      deadlineLabel: 'Registration Deadline',
+      pollQuestion: 'Have you registered for',
+      yesLabel: 'Registered',
+      noLabel: 'Not Registered',
+      pendingTitle: 'Pending Registrations',
+      reminderAction: 'register',
+      cardIcon: '🏆'
+    }
+  };
+
+  return meta[type];
+}
+
+async function sendOpportunityList(chatId, opportunityType = null) {
+  const allActiveItems = await Job.find({ telegramGroupId: chatId, status: 'active' }).sort({ createdAt: 1 });
+  const activeItems = opportunityType
+    ? allActiveItems
+      .map((item, allIndex) => ({ item, allIndex }))
+      .filter(({ item }) => getOpportunityType(item) === opportunityType)
+    : allActiveItems.map((item, allIndex) => ({ item, allIndex }));
+
+  if (activeItems.length === 0) {
+    const emptyLabel = opportunityType ? getOpportunityMeta({ opportunityType }).plural.toLowerCase() : 'opportunities';
+    return await bot.sendMessage(chatId, `📝 No active ${emptyLabel} being tracked right now.`);
+  }
+
+  const title = opportunityType ? getOpportunityMeta({ opportunityType }).listTitle : 'Active Opportunities';
+  let response = `💼 <b>${escapeHTML(title)}:</b>\n\n`;
+  activeItems.forEach(({ item, allIndex }) => {
+    const meta = getOpportunityMeta(item);
+    const deadlineStr = item.deadline ? new Date(item.deadline).toLocaleDateString('en-IN', {
+      day: 'numeric',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit'
+    }) : 'No Deadline';
+    response += `${allIndex + 1}. <b>${escapeHTML(item.company)}</b> - ${escapeHTML(item.role)} <i>(${escapeHTML(meta.singular)})</i>\n`;
+    response += `   📅 ${escapeHTML(meta.deadlineLabel)}: <i>${escapeHTML(deadlineStr)}</i>\n`;
+    if (item.eventDate) {
+      response += `   🗓️ Event Date: <i>${escapeHTML(new Date(item.eventDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }))}</i>\n`;
+    }
+    response += `   🔗 <a href="${escapeHTML(item.applyLink)}">${escapeHTML(meta.linkText)}</a>\n\n`;
+  });
+  response += `💡 Use <code>/jobstats &lt;number&gt;</code>, <code>/pending &lt;number&gt;</code>, or <code>/remindnow &lt;number&gt;</code> for details.`;
+
+  await bot.sendMessage(chatId, response, { parse_mode: 'HTML', disable_web_page_preview: true });
+}
+
 // ----------------------------------------------------
 // COMMAND HANDLERS
 // ----------------------------------------------------
@@ -180,16 +349,23 @@ bot.onText(/^\/help$/, async (msg) => {
   const helpText = `<b>JobPulse Bot Commands:</b>
 
 👥 <b>Public Commands:</b>
-• /jobs - Display active opportunities
-• /jobstats &lt;index/ID&gt; - Show application stats for a job
-• /pending &lt;index/ID&gt; - Show users who haven't applied
+• /opportunities - Display all active opportunities
+• /jobs - Display active jobs and internships
+• /hackathons - Display active hackathons
+• /competitions - Display active competitions
+• /jobstats &lt;index/ID&gt; - Show response stats for an opportunity
+• /pending &lt;index/ID&gt; - Show users who haven't applied/registered
 • /closed - Show archived/closed opportunities
 • /help - Display this help message
 
 🔑 <b>Admin Commands:</b>
 • /deletejob &lt;index/ID&gt; - Delete an opportunity
-• /editdeadline &lt;index/ID&gt; &lt;YYYY-MM-DD HH:MM&gt; - Edit job deadline
+• /editdeadline &lt;index/ID&gt; &lt;YYYY-MM-DD HH:MM&gt; - Edit opportunity deadline
 • /forcepoll &lt;text&gt; - Manually create a poll from text
+• /settings - View group automation settings
+• /autopoll on|off - Toggle automatic opportunity detection
+• /dmreminders on|off - Toggle deadline/reminder DMs
+• /remindnow &lt;index/ID&gt; - DM pending applicants now
 • /broadcast &lt;message&gt; - Broadcast message to all groups
 
 💡 <i>Note: To receive Direct Message reminders, please start the bot in private chat by clicking <a href="t.me/${botUser.username}">here</a> and sending /start.</i>`;
@@ -204,12 +380,23 @@ bot.onText(/^\/start$/, async (msg) => {
     const welcome = `👋 Hello ${escapeHTML(msg.from.first_name || 'there')}!
 I am <b>JobPulse</b>, the AI job tracking bot. 
 
-By starting me here, you have enabled <b>Direct Message Reminders</b> for jobs posted in your placement groups. I will send you reminders before deadlines if you haven't applied!
+By starting me here, you have enabled <b>Direct Message Reminders</b> for jobs, hackathons, and competitions posted in your placement groups. I will send you reminders before deadlines if you haven't applied or registered!
 
-To list jobs in your groups, use the bot commands in your group chats. Type /help to see all commands.`;
+To list opportunities in your groups, use the bot commands in your group chats. Type /help to see all commands.`;
     await bot.sendMessage(chatId, welcome, { parse_mode: 'HTML' });
   } else {
     await bot.sendMessage(chatId, 'Bot is active! Send /help to see available commands.');
+  }
+});
+
+// /opportunities
+bot.onText(/^\/opportunities$/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    await sendOpportunityList(chatId);
+  } catch (err) {
+    logger.error('Error in /opportunities command: %s', err.stack);
+    await bot.sendMessage(chatId, '❌ Failed to retrieve active opportunities.');
   }
 });
 
@@ -217,30 +404,32 @@ To list jobs in your groups, use the bot commands in your group chats. Type /hel
 bot.onText(/^\/jobs$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
-    const activeJobs = await Job.find({ telegramGroupId: chatId, status: 'active' }).sort({ createdAt: 1 });
-
-    if (activeJobs.length === 0) {
-      return await bot.sendMessage(chatId, '📝 No active job opportunities being tracked right now.');
-    }
-
-    let response = `💼 <b>Active Opportunities:</b>\n\n`;
-    activeJobs.forEach((job, index) => {
-      const deadlineStr = job.deadline ? new Date(job.deadline).toLocaleDateString('en-IN', {
-        day: 'numeric',
-        month: 'short',
-        hour: '2-digit',
-        minute: '2-digit'
-      }) : 'No Deadline';
-      response += `${index + 1}. <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)}\n`;
-      response += `   📅 Deadline: <i>${escapeHTML(deadlineStr)}</i>\n`;
-      response += `   🔗 <a href="${escapeHTML(job.applyLink)}">Apply Here</a>\n\n`;
-    });
-    response += `💡 Use <code>/jobstats &lt;number&gt;</code> or <code>/pending &lt;number&gt;</code> for details.`;
-
-    await bot.sendMessage(chatId, response, { parse_mode: 'HTML', disable_web_page_preview: true });
+    await sendOpportunityList(chatId, 'job');
   } catch (err) {
     logger.error('Error in /jobs command: %s', err.stack);
-    await bot.sendMessage(chatId, '❌ Failed to retrieve active opportunities.');
+    await bot.sendMessage(chatId, '❌ Failed to retrieve active jobs.');
+  }
+});
+
+// /hackathons
+bot.onText(/^\/hackathons$/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    await sendOpportunityList(chatId, 'hackathon');
+  } catch (err) {
+    logger.error('Error in /hackathons command: %s', err.stack);
+    await bot.sendMessage(chatId, '❌ Failed to retrieve active hackathons.');
+  }
+});
+
+// /competitions
+bot.onText(/^\/competitions$/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    await sendOpportunityList(chatId, 'competition');
+  } catch (err) {
+    logger.error('Error in /competitions command: %s', err.stack);
+    await bot.sendMessage(chatId, '❌ Failed to retrieve active competitions.');
   }
 });
 
@@ -257,9 +446,10 @@ bot.onText(/^\/closed$/, async (msg) => {
       return await bot.sendMessage(chatId, '📁 No closed or archived opportunities found.');
     }
 
-    let response = `📁 <b>Recently Closed/Archived Jobs:</b>\n\n`;
+    let response = `📁 <b>Recently Closed/Archived Opportunities:</b>\n\n`;
     closedJobs.forEach((job, index) => {
-      response += `${index + 1}. <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)} (${escapeHTML(job.status.toUpperCase())})\n`;
+      const meta = getOpportunityMeta(job);
+      response += `${index + 1}. <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)} <i>(${escapeHTML(meta.singular)}, ${escapeHTML(job.status.toUpperCase())})</i>\n`;
       response += `   🔗 <a href="${escapeHTML(job.applyLink)}">Link</a>\n\n`;
     });
 
@@ -282,12 +472,13 @@ bot.onText(/^\/jobstats(?:\s+(.+))?$/, async (msg, match) => {
   try {
     const job = await findJobByRef(chatId, jobRef);
     if (!job) {
-      return await bot.sendMessage(chatId, '❌ Job opportunity not found. Try running /jobs to see numbers.');
+      return await bot.sendMessage(chatId, '❌ Opportunity not found. Try running /opportunities to see numbers.');
     }
 
+    const meta = getOpportunityMeta(job);
     const responses = await PollResponse.find({ jobId: job._id });
-    const appliedCount = responses.filter(r => r.response === 'yes').length;
-    const notAppliedCount = responses.filter(r => r.response === 'no').length;
+    const yesCount = responses.filter(r => r.response === 'yes').length;
+    const noCount = responses.filter(r => r.response === 'no').length;
 
     // Estimate no response
     const group = await Group.findOne({ telegramGroupId: chatId });
@@ -299,15 +490,15 @@ bot.onText(/^\/jobstats(?:\s+(.+))?$/, async (msg, match) => {
 
     const deadlineStr = job.deadline ? new Date(job.deadline).toLocaleString('en-IN') : 'N/A';
 
-    const responseMsg = `📊 <b>Job Application Stats:</b>
+    const responseMsg = `📊 <b>${escapeHTML(meta.singular)} Response Stats:</b>
     
-<b>Company:</b> ${escapeHTML(job.company)}
-<b>Role:</b> ${escapeHTML(job.role)}
-<b>Deadline:</b> ${escapeHTML(deadlineStr)}
+<b>${escapeHTML(meta.companyLabel)}:</b> ${escapeHTML(job.company)}
+<b>${escapeHTML(meta.roleLabel)}:</b> ${escapeHTML(job.role)}
+<b>${escapeHTML(meta.deadlineLabel)}:</b> ${escapeHTML(deadlineStr)}
 <b>Status:</b> ${escapeHTML(job.status.toUpperCase())}
 
-✅ <b>Applied:</b> ${appliedCount}
-❌ <b>Not Applied:</b> ${notAppliedCount}
+✅ <b>${escapeHTML(meta.yesLabel)}:</b> ${yesCount}
+❌ <b>${escapeHTML(meta.noLabel)}:</b> ${noCount}
 ❔ <b>No Response (Est.):</b> ${noResponseCount}
 👥 <b>Total Group Members tracked:</b> ${totalMembers}
 
@@ -332,9 +523,10 @@ bot.onText(/^\/pending(?:\s+(.+))?$/, async (msg, match) => {
   try {
     const job = await findJobByRef(chatId, jobRef);
     if (!job) {
-      return await bot.sendMessage(chatId, '❌ Job opportunity not found.');
+      return await bot.sendMessage(chatId, '❌ Opportunity not found.');
     }
 
+    const meta = getOpportunityMeta(job);
     const responses = await PollResponse.find({ jobId: job._id });
     const votedNoUsernames = responses.filter(r => r.response === 'no').map(r => r.username ? `@${r.username}` : `User(${r.userId})`);
     
@@ -351,12 +543,12 @@ bot.onText(/^\/pending(?:\s+(.+))?$/, async (msg, match) => {
       });
     }
 
-    let responseMsg = `🚨 <b>Pending Applicants</b>
+    let responseMsg = `🚨 <b>${escapeHTML(meta.pendingTitle)}</b>
     
-<b>Company:</b> ${escapeHTML(job.company)}
-<b>Role:</b> ${escapeHTML(job.role)}
+<b>${escapeHTML(meta.companyLabel)}:</b> ${escapeHTML(job.company)}
+<b>${escapeHTML(meta.roleLabel)}:</b> ${escapeHTML(job.role)}
 
-❌ <b>Voted "No" (${votedNoUsernames.length}):</b>
+❌ <b>${escapeHTML(meta.noLabel)} (${votedNoUsernames.length}):</b>
 ${votedNoUsernames.length > 0 ? escapeHTML(votedNoUsernames.join('\n')) : '<i>None</i>' }
 
 ❔ <b>No Response (${noResponseUsernames.length}):</b>
@@ -372,6 +564,160 @@ ${noResponseUsernames.length > 0 ? escapeHTML(noResponseUsernames.join('\n')) : 
 // ----------------------------------------------------
 // ADMIN COMMAND HANDLERS
 // ----------------------------------------------------
+
+// /settings
+bot.onText(/^\/settings$/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+
+  if (!(await checkAdmin(chatId, userId))) {
+    return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
+  }
+
+  try {
+    const group = await Group.findOneAndUpdate(
+      { telegramGroupId: chatId },
+      {
+        $setOnInsert: {
+          telegramGroupId: chatId,
+          groupName: msg.chat.title || '',
+          admins: [userId]
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    await sendSettingsSummary(chatId, group);
+  } catch (err) {
+    logger.error('Error in /settings: %s', err.stack);
+    await bot.sendMessage(chatId, '❌ Failed to retrieve group settings.');
+  }
+});
+
+// /autopoll
+bot.onText(/^\/autopoll(?:\s+(\S+))?$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const enabled = parseToggleValue(match[1]);
+
+  if (!(await checkAdmin(chatId, userId))) {
+    return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
+  }
+
+  if (enabled === null) {
+    return await bot.sendMessage(chatId, '⚠️ Usage: <code>/autopoll on</code> or <code>/autopoll off</code>', { parse_mode: 'HTML' });
+  }
+
+  try {
+    const group = await Group.findOneAndUpdate(
+      { telegramGroupId: chatId },
+      {
+        $set: { 'settings.autoPollEnabled': enabled },
+        $setOnInsert: {
+          telegramGroupId: chatId,
+          groupName: msg.chat.title || '',
+          admins: [userId]
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    await bot.sendMessage(chatId, `✅ Auto job detection is now <b>${formatSettingState(group.settings.autoPollEnabled)}</b>.`, { parse_mode: 'HTML' });
+  } catch (err) {
+    logger.error('Error in /autopoll: %s', err.stack);
+    await bot.sendMessage(chatId, '❌ Failed to update auto job detection setting.');
+  }
+});
+
+// /dmreminders
+bot.onText(/^\/dmreminders(?:\s+(\S+))?$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const enabled = parseToggleValue(match[1]);
+
+  if (!(await checkAdmin(chatId, userId))) {
+    return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
+  }
+
+  if (enabled === null) {
+    return await bot.sendMessage(chatId, '⚠️ Usage: <code>/dmreminders on</code> or <code>/dmreminders off</code>', { parse_mode: 'HTML' });
+  }
+
+  try {
+    const group = await Group.findOneAndUpdate(
+      { telegramGroupId: chatId },
+      {
+        $set: { 'settings.dmRemindersEnabled': enabled },
+        $setOnInsert: {
+          telegramGroupId: chatId,
+          groupName: msg.chat.title || '',
+          admins: [userId]
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    await bot.sendMessage(chatId, `✅ DM reminders are now <b>${formatSettingState(group.settings.dmRemindersEnabled)}</b>.`, { parse_mode: 'HTML' });
+  } catch (err) {
+    logger.error('Error in /dmreminders: %s', err.stack);
+    await bot.sendMessage(chatId, '❌ Failed to update DM reminder setting.');
+  }
+});
+
+// /remindnow
+bot.onText(/^\/remindnow(?:\s+(.+))?$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const jobRef = match[1];
+
+  if (!(await checkAdmin(chatId, userId))) {
+    return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
+  }
+
+  if (!jobRef) {
+    return await bot.sendMessage(chatId, '⚠️ Please specify a job number or ID. Example: <code>/remindnow 1</code>', { parse_mode: 'HTML' });
+  }
+
+  try {
+    const job = await findJobByRef(chatId, jobRef, { status: 'active' });
+    if (!job) {
+      return await bot.sendMessage(chatId, '❌ Active opportunity not found. Try running /opportunities to see numbers.');
+    }
+
+    const meta = getOpportunityMeta(job);
+    const { group, targetUsers } = await getPendingReminderTargets(chatId, job);
+    if (!group) {
+      return await bot.sendMessage(chatId, '❌ This group is not registered yet. Send a regular message first, then try again.');
+    }
+
+    if (group.settings && group.settings.dmRemindersEnabled === false) {
+      return await bot.sendMessage(chatId, '⚠️ DM reminders are disabled for this group. Use <code>/dmreminders on</code> first.', { parse_mode: 'HTML' });
+    }
+
+    if (targetUsers.length === 0) {
+      return await bot.sendMessage(chatId, `✅ Everyone tracked has already marked this ${escapeHTML(meta.singular.toLowerCase())} as ${escapeHTML(meta.yesLabel.toLowerCase())}.`);
+    }
+
+    let sentCount = 0;
+    for (const target of targetUsers) {
+      try {
+        await bot.sendMessage(target.userId, buildManualReminderMessage(job), {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          reply_markup: buildJobActionKeyboard(job)
+        });
+        sentCount++;
+      } catch (err) {
+        logger.warn('Failed to send manual reminder to user %d: %s', target.userId, err.message);
+      }
+    }
+
+    await bot.sendMessage(chatId, `✅ Manual reminder sent to ${sentCount}/${targetUsers.length} pending users for <b>${escapeHTML(job.company)} - ${escapeHTML(job.role)}</b>.`, { parse_mode: 'HTML' });
+  } catch (err) {
+    logger.error('Error in /remindnow: %s', err.stack);
+    await bot.sendMessage(chatId, '❌ Failed to send manual reminders.');
+  }
+});
 
 // /deletejob
 bot.onText(/^\/deletejob(?:\s+(.+))?$/, async (msg, match) => {
@@ -390,14 +736,15 @@ bot.onText(/^\/deletejob(?:\s+(.+))?$/, async (msg, match) => {
   try {
     const job = await findJobByRef(chatId, jobRef);
     if (!job) {
-      return await bot.sendMessage(chatId, '❌ Job opportunity not found.');
+      return await bot.sendMessage(chatId, '❌ Opportunity not found.');
     }
 
     // Delete job, poll responses and reminders
     await Job.deleteOne({ _id: job._id });
     await PollResponse.deleteMany({ jobId: job._id });
+    await Reminder.deleteMany({ jobId: job._id });
     
-    await bot.sendMessage(chatId, `✅ Successfully deleted job opportunity: <b>${escapeHTML(job.company)} - ${escapeHTML(job.role)}</b>`, { parse_mode: 'HTML' });
+    await bot.sendMessage(chatId, `✅ Successfully deleted opportunity: <b>${escapeHTML(job.company)} - ${escapeHTML(job.role)}</b>`, { parse_mode: 'HTML' });
   } catch (err) {
     logger.error('Error in /deletejob: %s', err.stack);
     await bot.sendMessage(chatId, '❌ Failed to delete job opportunity.');
@@ -422,7 +769,7 @@ bot.onText(/^\/editdeadline(?:\s+(\S+)\s+(.+))?$/, async (msg, match) => {
   try {
     const job = await findJobByRef(chatId, jobRef);
     if (!job) {
-      return await bot.sendMessage(chatId, '❌ Job opportunity not found.');
+      return await bot.sendMessage(chatId, '❌ Opportunity not found.');
     }
 
     const newDate = new Date(dateStr);
@@ -455,7 +802,7 @@ bot.onText(/^\/forcepoll(?:\s+([\s\S]+))?$/, async (msg, match) => {
   }
 
   if (!jobText) {
-    return await bot.sendMessage(chatId, '⚠️ Please provide the text to parse. Example: `/forcepoll Google hiring SWE Intern apply at url`');
+    return await bot.sendMessage(chatId, '⚠️ Please provide the text to parse. Example: `/forcepoll Google hiring SWE Intern apply at url` or `/forcepoll Hackathon registration link...`');
   }
 
   const processingMsg = await bot.sendMessage(chatId, '🤖 Processing text with Gemini AI...');
@@ -464,7 +811,7 @@ bot.onText(/^\/forcepoll(?:\s+([\s\S]+))?$/, async (msg, match) => {
     const jobList = await extractJobDetails(jobText);
     
     if (!jobList || jobList.length === 0) {
-      return await bot.editMessageText('❌ Failed to extract any valid job details or find application links in the provided text.', {
+      return await bot.editMessageText('❌ Failed to extract any valid opportunity details or find application links in the provided text.', {
         chat_id: chatId,
         message_id: processingMsg.message_id
       });
@@ -516,14 +863,15 @@ bot.onText(/^\/broadcast(?:\s+([\s\S]+))?$/, async (msg, match) => {
 });
 
 // ----------------------------------------------------
-// AUTO JOB DETECTION AND POLL CREATION WORKFLOW
+// AUTO OPPORTUNITY DETECTION AND POLL CREATION WORKFLOW
 // ----------------------------------------------------
 
 /**
- * Creates job in DB, posts details and starts application tracking poll
+ * Creates opportunity in DB, posts details and starts tracking poll
  */
 async function createJobAndPoll(chatId, jobDetails, originalMessageId) {
   try {
+    const meta = getOpportunityMeta(jobDetails);
     // Normal duplicate check by normalized URL and Company
     const normalizedUrl = normalizeUrl(jobDetails.applyLink);
     
@@ -534,7 +882,7 @@ async function createJobAndPoll(chatId, jobDetails, originalMessageId) {
     });
 
     if (existingJob) {
-      logger.info('Duplicate job detected by URL match: %s', normalizedUrl);
+      logger.info('Duplicate opportunity detected by URL match: %s', normalizedUrl);
       return await bot.sendMessage(chatId, '⚠️ Opportunity already being tracked. Do not create a new poll.', {
         reply_to_message_id: originalMessageId
       });
@@ -552,13 +900,14 @@ async function createJobAndPoll(chatId, jobDetails, originalMessageId) {
     const botUser = await bot.getMe();
 
     const footerText = isChannel 
-      ? `⚡ <i>Note: Channel polls are anonymous. Start this bot in <a href="t.me/${botUser.username}">DMs</a> to track and receive personal application alerts!</i>`
-      : `⚡ <i>Please vote on the poll below to track your application status. Start this bot in <a href="t.me/${botUser.username}">DMs</a> to receive alerts!</i>`;
+      ? `⚡ <i>Note: Channel polls are anonymous. Start this bot in <a href="t.me/${botUser.username}">DMs</a> to track and receive personal alerts!</i>`
+      : `⚡ <i>Please vote on the poll below to track your status. Start this bot in <a href="t.me/${botUser.username}">DMs</a> to receive alerts!</i>`;
 
     // 1. Send details card
-    const jobCardText = `📢 <b>${escapeHTML(jobDetails.company)}</b> - ${escapeHTML(jobDetails.role)}
-${jobDetails.location ? `📍 <b>Location:</b> ${escapeHTML(jobDetails.location)}\n` : ''}${jobDetails.salary ? `💰 <b>Salary:</b> ${escapeHTML(jobDetails.salary)}\n` : ''}${jobDetails.batchEligibility ? `🎓 <b>Eligibility:</b> ${escapeHTML(jobDetails.batchEligibility)}\n` : ''}📅 <b>Deadline:</b> <i>${escapeHTML(deadlineFormatted)}</i>
-🔗 <a href="${escapeHTML(jobDetails.applyLink)}">Apply Here</a>
+    const jobCardText = `${meta.cardIcon} <b>${escapeHTML(jobDetails.company)}</b> - ${escapeHTML(jobDetails.role)}
+<b>Type:</b> ${escapeHTML(meta.singular)}
+${jobDetails.location ? `📍 <b>Location:</b> ${escapeHTML(jobDetails.location)}\n` : ''}${jobDetails.format ? `🧭 <b>Format:</b> ${escapeHTML(jobDetails.format)}\n` : ''}${jobDetails.salary ? `💰 <b>Compensation:</b> ${escapeHTML(jobDetails.salary)}\n` : ''}${jobDetails.prize ? `🏆 <b>Prize/Rewards:</b> ${escapeHTML(jobDetails.prize)}\n` : ''}${jobDetails.batchEligibility ? `🎓 <b>Eligibility:</b> ${escapeHTML(jobDetails.batchEligibility)}\n` : ''}${jobDetails.eventDate ? `🗓️ <b>Event Date:</b> <i>${escapeHTML(new Date(jobDetails.eventDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }))}</i>\n` : ''}📅 <b>${escapeHTML(meta.deadlineLabel)}:</b> <i>${escapeHTML(deadlineFormatted)}</i>
+🔗 <a href="${escapeHTML(jobDetails.applyLink)}">${escapeHTML(meta.linkText)}</a>
 
 ${footerText}`;
 
@@ -569,13 +918,14 @@ ${footerText}`;
     });
 
     // 2. Send Poll
-    const pollMsg = await bot.sendPoll(chatId, `Have you applied for ${jobDetails.company} - ${jobDetails.role}?`, ['Yes', 'No'], {
+    const pollMsg = await bot.sendPoll(chatId, `${meta.pollQuestion} ${jobDetails.company} - ${jobDetails.role}?`, ['Yes', 'No'], {
       is_anonymous: isChannel,
       reply_to_message_id: descriptionMsg.message_id
     });
 
     // 3. Save to DB
     const newJob = new Job({
+      opportunityType: getOpportunityType(jobDetails),
       company: jobDetails.company,
       role: jobDetails.role,
       applyLink: normalizedUrl,
@@ -583,6 +933,9 @@ ${footerText}`;
       location: jobDetails.location,
       salary: jobDetails.salary,
       batchEligibility: jobDetails.batchEligibility,
+      prize: jobDetails.prize,
+      eventDate: jobDetails.eventDate,
+      format: jobDetails.format,
       telegramMessageId: descriptionMsg.message_id,
       telegramGroupId: chatId,
       telegramPollId: pollMsg.poll.id,
@@ -590,15 +943,15 @@ ${footerText}`;
     });
 
     await newJob.save();
-    logger.info('Job successfully created and poll launched: %s - %s', newJob.company, newJob.role);
+    logger.info('Opportunity successfully created and poll launched: %s - %s', newJob.company, newJob.role);
 
   } catch (err) {
-    logger.error('Error creating job and poll: %s', err.stack);
-    await bot.sendMessage(chatId, '❌ An error occurred while launching application tracking for this job.');
+    logger.error('Error creating opportunity and poll: %s', err.stack);
+    await bot.sendMessage(chatId, '❌ An error occurred while launching tracking for this opportunity.');
   }
 }
 
-// Group chat message listener for auto job detection
+// Group chat message listener for auto opportunity detection
 bot.on('message', async (msg) => {
   // Ignore bots or private commands (commands are handled by command handlers)
   if (msg.from && msg.from.is_bot) return;
@@ -624,7 +977,7 @@ bot.on('message', async (msg) => {
   const urls = text.match(urlRegex);
 
   if (urls && urls.length > 0) {
-    logger.info('Detected potential job post in group %d...', chatId);
+    logger.info('Detected potential opportunity post in group %d...', chatId);
     
     // Resolve short URLs first to expand bit.ly, tinyurl, etc.
     const resolvedUrls = [];
@@ -722,9 +1075,10 @@ bot.on('poll_answer', async (answer) => {
 
       // Send instant DM confirmation
       try {
+        const meta = getOpportunityMeta(job);
         const dmText = vote === 'yes'
-          ? `✅ <b>Applied:</b> <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)}\nReminders disabled. Good luck! 🚀`
-          : `⏰ <b>Not Applied:</b> <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)}\nI'll remind you before the deadline. ⏰`;
+          ? `✅ <b>${escapeHTML(meta.yesLabel)}:</b> <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)}\nReminders disabled. Good luck! 🚀`
+          : `⏰ <b>${escapeHTML(meta.noLabel)}:</b> <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)}\nI'll remind you before the deadline. ⏰`;
         
         await bot.sendMessage(userId, dmText, { parse_mode: 'HTML' });
       } catch (dmErr) {

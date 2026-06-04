@@ -12,7 +12,7 @@ const reminderSchema = new mongoose.Schema({
   },
   reminderType: {
     type: String,
-    enum: ['48h', '24h', '6h', '1h', '24h_post'],
+    trim: true,
     required: true
   },
   sentAt: {

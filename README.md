@@ -1,14 +1,14 @@
-# JobPulse: AI-Powered Telegram Job Tracking Bot
+# JobPulse: AI-Powered Telegram Opportunity Tracking Bot
 
-JobPulse is an AI-powered Telegram bot built with Node.js, Express, MongoDB (Mongoose), and the Gemini API. It is designed to help student placement groups, coding communities, and internship channels automate the detection, parsing, and tracking of job opportunities.
+JobPulse is an AI-powered Telegram bot built with Node.js, Express, MongoDB (Mongoose), and the Gemini API. It is designed to help student placement groups, coding communities, and internship channels automate the detection, parsing, and tracking of jobs, internships, hackathons, and competitions.
 
 ---
 
 ## 🌟 Key Features
 
-1. **Automatic Job Detection**: Listens to messages in registered Telegram groups and channels. When a message contains a URL, the bot triggers parsing.
-2. **AI-Powered Metadata Extraction**: Leverages **Gemini 2.5 Flash** with strict JSON schemas to extract structured metadata (Company, Role, Application Link, Deadline, Location, Salary, Batch/Eligibility).
-3. **Multi-Job Postings Support**: Capable of detecting and extracting multiple job opportunities from a single message or digest post, launching individual polls for each opportunity.
+1. **Automatic Opportunity Detection**: Listens to messages in registered Telegram groups and channels. When a message contains a URL, the bot triggers parsing.
+2. **AI-Powered Metadata Extraction**: Leverages **Gemini 2.5 Flash** with strict JSON schemas to extract structured metadata (Type, Organizer/Company, Role/Event, Link, Deadline, Location, Salary/Prize, Batch/Eligibility, Event Date, Format).
+3. **Multi-Opportunity Postings Support**: Capable of detecting and extracting multiple jobs, hackathons, and competitions from a single message or digest post, launching individual polls for each opportunity.
 4. **Interactive Tracking Polls**: Generates non-anonymous Telegram polls (Yes/No) automatically under the job card.
 5. **Short & Professional Card Templates**: Displays clean opportunity cards with the **Company Name** clearly bolded in the header.
 6. **Smart & Configurable Reminders**:
@@ -103,16 +103,23 @@ npm install
 3. Every group member who wishes to receive private follow-up alerts must open a DM with the bot and send `/start`.
 
 ### Public Group Commands
-* `/jobs` - Display active opportunities.
-* `/jobstats <number>` - View detailed stats (Applied, Not Applied, No Response counts) for a job.
-* `/pending <number>` - List members who haven't applied or voted "No".
+* `/opportunities` - Display all active jobs, hackathons, and competitions.
+* `/jobs` - Display active jobs and internships.
+* `/hackathons` - Display active hackathons.
+* `/competitions` - Display active competitions.
+* `/jobstats <number>` - View detailed stats (Applied/Registered, Not Applied/Not Registered, No Response counts) for an opportunity.
+* `/pending <number>` - List members who haven't applied/registered or voted "No".
 * `/closed` - Show recently closed/archived opportunities.
 * `/help` - Show usage guidelines.
 
 ### Group Administrator Commands
 * `/deletejob <number>` - Close and remove a job tracking record.
-* `/editdeadline <number> <YYYY-MM-DD HH:MM>` - Adjust the application deadline.
+* `/editdeadline <number> <YYYY-MM-DD HH:MM>` - Adjust the application or registration deadline.
 * `/forcepoll <text>` - Force-parse raw text and manually spawn a job details card + poll.
+* `/settings` - View group automation settings.
+* `/autopoll on|off` - Toggle automatic opportunity detection for the group.
+* `/dmreminders on|off` - Toggle deadline and post-creation DM reminders for the group.
+* `/remindnow <number>` - Immediately DM pending users for an active opportunity.
 * `/broadcast <message>` - Broadcast an announcement to all registered groups.
 
 ---

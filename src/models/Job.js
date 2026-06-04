@@ -1,6 +1,12 @@
 const mongoose = require('mongoose');
 
 const jobSchema = new mongoose.Schema({
+  opportunityType: {
+    type: String,
+    enum: ['job', 'hackathon', 'competition'],
+    default: 'job',
+    index: true
+  },
   company: {
     type: String,
     required: true,
@@ -31,6 +37,20 @@ const jobSchema = new mongoose.Schema({
     default: ''
   },
   batchEligibility: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  prize: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  eventDate: {
+    type: Date,
+    default: null
+  },
+  format: {
     type: String,
     trim: true,
     default: ''

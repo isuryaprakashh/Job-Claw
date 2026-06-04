@@ -9,9 +9,9 @@ if (!apiKey) {
 const genAI = new GoogleGenerativeAI(apiKey || 'dummy-key');
 
 /**
- * Parses raw job post content using Gemini AI, extracting a list of job details.
+ * Parses raw opportunity post content using Gemini AI, extracting a list of opportunity details.
  * @param {string} textContent The raw message content from Telegram.
- * @returns {Promise<Array<object>>} A list of parsed job metadata objects.
+ * @returns {Promise<Array<object>>} A list of parsed opportunity metadata objects.
  */
 async function extractJobDetails(textContent) {
   try {
@@ -26,20 +26,24 @@ async function extractJobDetails(textContent) {
     }
 
     const currentYear = new Date().getFullYear();
-    const systemPrompt = `You are a job opportunity extraction engine.
-Your task is to analyze the user's message and extract all valid job opportunities present. 
+    const systemPrompt = `You are an opportunity extraction engine for student communities.
+Your task is to analyze the user's message and extract all valid jobs, internships, hackathons, coding contests, case competitions, business competitions, challenges, ideathons, quizzes, and similar student opportunities present.
 For each opportunity, extract:
-- company (name of the company offering the job/internship)
-- role (title of the job or internship role)
-- applyLink (the URL to apply for the job. MUST be a valid HTTP/HTTPS link. Extract the most direct application link available for this specific job)
-- deadline (date when applications close. If the raw text mentions a deadline, convert it to YYYY-MM-DD format. Assume the current year is ${currentYear} if not specified. If deadline is missing or ambiguous, set it to null)
-- location (job location e.g. Bangalore, Remote, etc. If missing, use empty string)
+- opportunityType (must be exactly one of: "job", "hackathon", "competition". Use "job" for jobs and internships, "hackathon" for hackathons/buildathons, and "competition" for coding contests, case competitions, quizzes, challenges, ideathons, or other competitive events)
+- company (for jobs: company name. For hackathons/competitions: organizer, host, platform, or sponsor name)
+- role (for jobs: job/internship title. For hackathons/competitions: event title)
+- applyLink (the URL to apply/register for the opportunity. MUST be a valid HTTP/HTTPS link. Extract the most direct application/registration link available)
+- deadline (date when applications/registrations close. If the raw text mentions a deadline, convert it to YYYY-MM-DD format. Assume the current year is ${currentYear} if not specified. If deadline is missing or ambiguous, set it to null)
+- location (job/event location e.g. Bangalore, Remote, Online, etc. If missing, use empty string)
 - salary (salary, stipend, or compensation details. If missing, use empty string)
 - batchEligibility (graduating batch/year eligibility e.g. "2025/2026 Batch", "2026 graduates only". If missing, use empty string)
+- prize (prize pool, rewards, certificates, goodies, or benefits for hackathons/competitions. If missing, use empty string)
+- eventDate (date when the hackathon/competition/event happens, not the registration deadline. Convert to YYYY-MM-DD. If missing or ambiguous, set it to null)
+- format (online/offline/hybrid/team size/duration details when available. If missing, use empty string)
 
-Return a JSON array of objects containing these keys. If no job opportunities are found, return an empty array []. Do not include any formatting, markdown markers, or chat text outside the JSON.`;
+Return a JSON array of objects containing these keys. If no valid opportunities are found, return an empty array []. Do not include any formatting, markdown markers, or chat text outside the JSON.`;
 
-    const prompt = `Raw Job Posting Content:
+    const prompt = `Raw Opportunity Posting Content:
 """
 ${textContent}
 """`;
@@ -52,17 +56,21 @@ ${textContent}
         properties: {
           company: { type: "string" },
           role: { type: "string" },
+          opportunityType: { type: "string", enum: ["job", "hackathon", "competition"] },
           applyLink: { type: "string" },
           deadline: { type: "string", nullable: true },
           location: { type: "string" },
           salary: { type: "string" },
-          batchEligibility: { type: "string" }
+          batchEligibility: { type: "string" },
+          prize: { type: "string" },
+          eventDate: { type: "string", nullable: true },
+          format: { type: "string" }
         },
-        required: ["company", "role", "applyLink"]
+        required: ["company", "role", "applyLink", "opportunityType"]
       }
     };
 
-    logger.info('Calling Gemini API (%s) for multiple job details extraction...', modelName);
+    logger.info('Calling Gemini API (%s) for multiple opportunity details extraction...', modelName);
     const result = await model.generateContent({
       contents: [
         { role: 'user', parts: [{ text: systemPrompt + '\n\n' + prompt }] }
@@ -89,7 +97,7 @@ ${textContent}
         continue;
       }
 
-      // Clean up deadline
+      // Clean up dates
       let deadlineDate = null;
       if (parsedData.deadline) {
         const parsedDate = new Date(parsedData.deadline);
@@ -98,14 +106,30 @@ ${textContent}
         }
       }
 
+      let eventDate = null;
+      if (parsedData.eventDate) {
+        const parsedDate = new Date(parsedData.eventDate);
+        if (!isNaN(parsedDate.getTime())) {
+          eventDate = parsedDate;
+        }
+      }
+
+      const opportunityType = ['job', 'hackathon', 'competition'].includes(parsedData.opportunityType)
+        ? parsedData.opportunityType
+        : 'job';
+
       normalizedJobs.push({
+        opportunityType,
         company: parsedData.company,
         role: parsedData.role,
         applyLink: parsedData.applyLink,
         deadline: deadlineDate,
         location: parsedData.location || '',
         salary: parsedData.salary || '',
-        batchEligibility: parsedData.batchEligibility || ''
+        batchEligibility: parsedData.batchEligibility || '',
+        prize: parsedData.prize || '',
+        eventDate,
+        format: parsedData.format || ''
       });
     }
 
@@ -122,13 +146,17 @@ ${textContent}
       // Extract unique urls
       const uniqueUrls = [...new Set(urls)];
       return uniqueUrls.map(url => ({
-        company: 'Unknown Company',
-        role: 'Job Opportunity',
+        opportunityType: 'job',
+        company: 'Unknown Organizer',
+        role: 'Opportunity',
         applyLink: url,
         deadline: null,
         location: '',
         salary: '',
-        batchEligibility: ''
+        batchEligibility: '',
+        prize: '',
+        eventDate: null,
+        format: ''
       }));
     }
 
