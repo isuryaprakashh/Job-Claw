@@ -357,7 +357,7 @@ async function sendOpportunityList(chatId, opportunityType = null) {
 // ----------------------------------------------------
 
 // /help
-bot.onText(/^\/help$|^❓ Get Help$/, async (msg) => {
+bot.onText(/^\/help(?:@\w+)?$|^❓ Get Help$/, async (msg) => {
   const chatId = msg.chat.id;
   const botUser = await bot.getMe();
   const helpText = `<b>JobClaw Bot Commands:</b>
@@ -388,7 +388,7 @@ bot.onText(/^\/help$|^❓ Get Help$/, async (msg) => {
 });
 
 // /start
-bot.onText(/^\/start$/, async (msg) => {
+bot.onText(/^\/start(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
   if (msg.chat.type === 'private') {
     const welcome = `👋 Hello ${escapeHTML(msg.from.first_name || 'there')}!
@@ -418,7 +418,7 @@ To list opportunities in your groups, use the bot commands in your group chats. 
 });
 
 // /opportunities
-bot.onText(/^\/opportunities$/, async (msg) => {
+bot.onText(/^\/opportunities(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
     await sendOpportunityList(chatId);
@@ -429,7 +429,7 @@ bot.onText(/^\/opportunities$/, async (msg) => {
 });
 
 // /jobs
-bot.onText(/^\/jobs$|^💼 Active Jobs$/, async (msg) => {
+bot.onText(/^\/jobs(?:@\w+)?$|^💼 Active Jobs$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
     await sendOpportunityList(chatId, 'job');
@@ -440,7 +440,7 @@ bot.onText(/^\/jobs$|^💼 Active Jobs$/, async (msg) => {
 });
 
 // /hackathons
-bot.onText(/^\/hackathons$/, async (msg) => {
+bot.onText(/^\/hackathons(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
     await sendOpportunityList(chatId, 'hackathon');
@@ -451,7 +451,7 @@ bot.onText(/^\/hackathons$/, async (msg) => {
 });
 
 // /competitions
-bot.onText(/^\/competitions$/, async (msg) => {
+bot.onText(/^\/competitions(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
     await sendOpportunityList(chatId, 'competition');
@@ -462,7 +462,7 @@ bot.onText(/^\/competitions$/, async (msg) => {
 });
 
 // /closed
-bot.onText(/^\/closed$|^📁 Closed Jobs$/, async (msg) => {
+bot.onText(/^\/closed(?:@\w+)?$|^📁 Closed Jobs$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
     const closedJobs = await Job.find({
@@ -489,7 +489,7 @@ bot.onText(/^\/closed$|^📁 Closed Jobs$/, async (msg) => {
 });
 
 // /jobstats
-bot.onText(/^\/jobstats(?:\s+(.+))?$/, async (msg, match) => {
+bot.onText(/^\/jobstats(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const jobRef = match[1];
 
@@ -540,7 +540,7 @@ bot.onText(/^\/jobstats(?:\s+(.+))?$/, async (msg, match) => {
 });
 
 // /pending
-bot.onText(/^\/pending(?:\s+(.+))?$/, async (msg, match) => {
+bot.onText(/^\/pending(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const jobRef = match[1];
 
@@ -594,7 +594,7 @@ ${noResponseUsernames.length > 0 ? escapeHTML(noResponseUsernames.join('\n')) : 
 // ----------------------------------------------------
 
 // /settings
-bot.onText(/^\/settings$/, async (msg) => {
+bot.onText(/^\/settings(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
@@ -623,7 +623,7 @@ bot.onText(/^\/settings$/, async (msg) => {
 });
 
 // /autopoll
-bot.onText(/^\/autopoll(?:\s+(\S+))?$/, async (msg, match) => {
+bot.onText(/^\/autopoll(?:@\w+)?(?:\s+(\S+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const enabled = parseToggleValue(match[1]);
@@ -658,7 +658,7 @@ bot.onText(/^\/autopoll(?:\s+(\S+))?$/, async (msg, match) => {
 });
 
 // /dmreminders
-bot.onText(/^\/dmreminders(?:\s+(\S+))?$/, async (msg, match) => {
+bot.onText(/^\/dmreminders(?:@\w+)?(?:\s+(\S+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const enabled = parseToggleValue(match[1]);
@@ -693,7 +693,7 @@ bot.onText(/^\/dmreminders(?:\s+(\S+))?$/, async (msg, match) => {
 });
 
 // /remindnow
-bot.onText(/^\/remindnow(?:\s+(.+))?$/, async (msg, match) => {
+bot.onText(/^\/remindnow(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const jobRef = match[1];
@@ -748,7 +748,7 @@ bot.onText(/^\/remindnow(?:\s+(.+))?$/, async (msg, match) => {
 });
 
 // /deletejob
-bot.onText(/^\/deletejob(?:\s+(.+))?$/, async (msg, match) => {
+bot.onText(/^\/deletejob(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const jobRef = match[1];
@@ -780,7 +780,7 @@ bot.onText(/^\/deletejob(?:\s+(.+))?$/, async (msg, match) => {
 });
 
 // /editdeadline
-bot.onText(/^\/editdeadline(?:\s+(\S+)\s+(.+))?$/, async (msg, match) => {
+bot.onText(/^\/editdeadline(?:@\w+)?(?:\s+(\S+)\s+(.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const jobRef = match[1];
@@ -820,7 +820,7 @@ bot.onText(/^\/editdeadline(?:\s+(\S+)\s+(.+))?$/, async (msg, match) => {
 });
 
 // /forcepoll
-bot.onText(/^\/forcepoll(?:\s+([\s\S]+))?$/, async (msg, match) => {
+bot.onText(/^\/forcepoll(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const jobText = match[1];
@@ -884,7 +884,7 @@ bot.onText(/^\/forcepoll(?:\s+([\s\S]+))?$/, async (msg, match) => {
 });
 
 // /broadcast
-bot.onText(/^\/broadcast(?:\s+([\s\S]+))?$/, async (msg, match) => {
+bot.onText(/^\/broadcast(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const broadcastMsg = match[1];
