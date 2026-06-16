@@ -317,7 +317,7 @@ function getOpportunityMeta(item) {
   return meta[type];
 }
 
-async function sendOpportunityList(chatId, opportunityType = null) {
+async function sendOpportunityList(chatId, opportunityType = null, messageId = null) {
   const allActiveItems = await Job.find({ telegramGroupId: chatId, status: 'active' }).sort({ createdAt: 1 });
   const activeItems = opportunityType
     ? allActiveItems
@@ -327,7 +327,12 @@ async function sendOpportunityList(chatId, opportunityType = null) {
 
   if (activeItems.length === 0) {
     const emptyLabel = opportunityType ? getOpportunityMeta({ opportunityType }).plural.toLowerCase() : 'opportunities';
-    return await bot.sendMessage(chatId, `📝 No active ${emptyLabel} being tracked right now.`);
+    const emptyText = `📝 No active ${emptyLabel} being tracked right now.`;
+    if (messageId) {
+      return await bot.editMessageText(emptyText, { chat_id: chatId, message_id: messageId });
+    } else {
+      return await bot.sendMessage(chatId, emptyText);
+    }
   }
 
   const title = opportunityType ? getOpportunityMeta({ opportunityType }).listTitle : 'Active Opportunities';
@@ -347,9 +352,32 @@ async function sendOpportunityList(chatId, opportunityType = null) {
     }
     response += `   🔗 <a href="${escapeHTML(item.applyLink)}">${escapeHTML(meta.linkText)}</a>\n\n`;
   });
-  response += `💡 Use <code>/jobstats &lt;number&gt;</code>, <code>/pending &lt;number&gt;</code>, or <code>/remindnow &lt;number&gt;</code> for details.`;
 
-  await bot.sendMessage(chatId, response, { parse_mode: 'HTML', disable_web_page_preview: true });
+  // Build inline keyboard for active items
+  const inlineKeyboard = [];
+  const buttons = activeItems.map(({ item, allIndex }) => ({
+    text: `${allIndex + 1}. ${item.company}`,
+    callback_data: `view_job:${item._id}:${opportunityType || ''}`
+  }));
+
+  // Group buttons in rows of 2
+  for (let i = 0; i < buttons.length; i += 2) {
+    inlineKeyboard.push(buttons.slice(i, i + 2));
+  }
+
+  const options = {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: inlineKeyboard
+    }
+  };
+
+  if (messageId) {
+    await bot.editMessageText(response, { chat_id: chatId, message_id: messageId, ...options });
+  } else {
+    await bot.sendMessage(chatId, response, options);
+  }
 }
 
 // ----------------------------------------------------
@@ -1121,6 +1149,338 @@ bot.on('poll_answer', async (answer) => {
     }
   } catch (err) {
     logger.error('Error tracking poll answer: %s', err.stack);
+  }
+});
+
+// ----------------------------------------------------
+// INTERACTIVE CALLBACK QUERY HANDLER (INLINE BUTTON MENUS)
+// ----------------------------------------------------
+bot.on('callback_query', async (callbackQuery) => {
+  const msg = callbackQuery.message;
+  const data = callbackQuery.data;
+  const userId = callbackQuery.from.id;
+  const chatId = msg.chat.id;
+
+  try {
+    if (data.startsWith('view_job:')) {
+      const parts = data.split(':');
+      const jobId = parts[1];
+      const optType = parts[2] || '';
+
+      const job = await Job.findById(jobId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
+      }
+
+      const meta = getOpportunityMeta(job);
+      const deadlineStr = job.deadline ? new Date(job.deadline).toLocaleString('en-IN') : 'N/A';
+
+      const detailMsg = `💼 <b>${escapeHTML(meta.singular)} Details:</b>
+
+<b>${escapeHTML(meta.companyLabel)}:</b> ${escapeHTML(job.company)}
+<b>${escapeHTML(meta.roleLabel)}:</b> ${escapeHTML(job.role)}
+<b>${escapeHTML(meta.deadlineLabel)}:</b> ${escapeHTML(deadlineStr)}
+<b>Status:</b> ${escapeHTML(job.status.toUpperCase())}
+
+🔗 <a href="${escapeHTML(job.applyLink)}">${escapeHTML(meta.linkText)}</a>`;
+
+      const inlineKeyboard = [
+        [
+          { text: '📊 Stats', callback_data: `stats:${jobId}:${optType}` },
+          { text: '🚨 Pending', callback_data: `pending:${jobId}:${optType}` }
+        ],
+        [
+          { text: '⏰ Remind Now', callback_data: `remind:${jobId}:${optType}` },
+          { text: '📅 Edit Deadline', callback_data: `edit_deadline_prompt:${jobId}:${optType}` }
+        ],
+        [
+          { text: '🗑️ Delete', callback_data: `delete_prompt:${jobId}:${optType}` },
+          { text: '⬅️ Back to List', callback_data: `back_to_list:${optType}` }
+        ]
+      ];
+
+      await bot.editMessageText(detailMsg, {
+        chat_id: chatId,
+        message_id: msg.message_id,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: inlineKeyboard }
+      });
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data.startsWith('stats:')) {
+      const parts = data.split(':');
+      const jobId = parts[1];
+      const optType = parts[2] || '';
+
+      const job = await Job.findById(jobId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
+      }
+
+      const meta = getOpportunityMeta(job);
+      const responses = await PollResponse.find({ jobId: job._id });
+      const yesCount = responses.filter(r => r.response === 'yes').length;
+      const noCount = responses.filter(r => r.response === 'no').length;
+
+      const group = await Group.findOne({ telegramGroupId: chatId });
+      const totalMembers = group ? group.members.length : 0;
+      const respondedUserIds = new Set(responses.map(r => r.userId));
+      const noResponseCount = Math.max(0, totalMembers - respondedUserIds.size);
+
+      const deadlineStr = job.deadline ? new Date(job.deadline).toLocaleString('en-IN') : 'N/A';
+
+      const statsMsg = `📊 <b>${escapeHTML(meta.singular)} Response Stats:</b>
+
+<b>${escapeHTML(meta.companyLabel)}:</b> ${escapeHTML(job.company)}
+<b>${escapeHTML(meta.roleLabel)}:</b> ${escapeHTML(job.role)}
+<b>${escapeHTML(meta.deadlineLabel)}:</b> ${escapeHTML(deadlineStr)}
+<b>Status:</b> ${escapeHTML(job.status.toUpperCase())}
+
+✅ <b>${escapeHTML(meta.yesLabel)}:</b> ${yesCount}
+❌ <b>${escapeHTML(meta.noLabel)}:</b> ${noCount}
+❔ <b>No Response (Est.):</b> ${noResponseCount}
+👥 <b>Total Group Members tracked:</b> ${totalMembers}
+
+🔗 <a href="${escapeHTML(job.applyLink)}">${escapeHTML(meta.linkText)}</a>`;
+
+      const inlineKeyboard = [
+        [{ text: '⬅️ Back to Details', callback_data: `view_job:${jobId}:${optType}` }]
+      ];
+
+      await bot.editMessageText(statsMsg, {
+        chat_id: chatId,
+        message_id: msg.message_id,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: inlineKeyboard }
+      });
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data.startsWith('pending:')) {
+      const parts = data.split(':');
+      const jobId = parts[1];
+      const optType = parts[2] || '';
+
+      const job = await Job.findById(jobId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
+      }
+
+      const meta = getOpportunityMeta(job);
+      const responses = await PollResponse.find({ jobId: job._id });
+      const votedNoUsernames = responses.filter(r => r.response === 'no').map(r => r.username ? `@${r.username}` : `User(${r.userId})`);
+
+      const group = await Group.findOne({ telegramGroupId: chatId });
+      const respondedUserIds = new Set(responses.map(r => r.userId));
+      const noResponseUsernames = [];
+
+      if (group) {
+        group.members.forEach(member => {
+          if (!respondedUserIds.has(member.userId)) {
+            noResponseUsernames.push(member.username ? `@${member.username}` : `${member.firstName || ''} (${member.userId})`);
+          }
+        });
+      }
+
+      const pendingMsg = `🚨 <b>${escapeHTML(meta.pendingTitle)}</b>
+
+<b>${escapeHTML(meta.companyLabel)}:</b> ${escapeHTML(job.company)}
+<b>${escapeHTML(meta.roleLabel)}:</b> ${escapeHTML(job.role)}
+
+❌ <b>${escapeHTML(meta.noLabel)} (${votedNoUsernames.length}):</b>
+${votedNoUsernames.length > 0 ? escapeHTML(votedNoUsernames.join('\n')) : '<i>None</i>'}
+
+❔ <b>No Response (${noResponseUsernames.length}):</b>
+${noResponseUsernames.length > 0 ? escapeHTML(noResponseUsernames.join('\n')) : '<i>None</i>'}`;
+
+      const inlineKeyboard = [
+        [{ text: '⬅️ Back to Details', callback_data: `view_job:${jobId}:${optType}` }]
+      ];
+
+      await bot.editMessageText(pendingMsg, {
+        chat_id: chatId,
+        message_id: msg.message_id,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: inlineKeyboard }
+      });
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data.startsWith('remind:')) {
+      const parts = data.split(':');
+      const jobId = parts[1];
+
+      // Admin verification
+      if (!(await checkAdmin(chatId, userId))) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⛔ Only group administrators can perform this action.',
+          show_alert: true
+        });
+      }
+
+      const job = await Job.findOne({ _id: jobId, status: 'active' });
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Active opportunity not found.', show_alert: true });
+      }
+
+      const meta = getOpportunityMeta(job);
+      const { group, targetUsers } = await getPendingReminderTargets(chatId, job);
+      if (!group) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Group is not registered.', show_alert: true });
+      }
+
+      if (group.settings && group.settings.dmRemindersEnabled === false) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⚠️ DM reminders are disabled for this group.',
+          show_alert: true
+        });
+      }
+
+      if (targetUsers.length === 0) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: `✅ Everyone has already marked this as ${meta.yesLabel}.`,
+          show_alert: true
+        });
+      }
+
+      // Send reminders in the background
+      let sentCount = 0;
+      for (const target of targetUsers) {
+        try {
+          await bot.sendMessage(target.userId, buildManualReminderMessage(job), {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            reply_markup: buildJobActionKeyboard(job)
+          });
+          sentCount++;
+        } catch (err) {
+          logger.warn('Failed to send manual reminder to user %d: %s', target.userId, err.message);
+        }
+      }
+
+      await bot.answerCallbackQuery(callbackQuery.id, {
+        text: `✅ Reminders sent to ${sentCount}/${targetUsers.length} pending users!`,
+        show_alert: true
+      });
+
+    } else if (data.startsWith('delete_prompt:')) {
+      const parts = data.split(':');
+      const jobId = parts[1];
+      const optType = parts[2] || '';
+
+      // Admin verification
+      if (!(await checkAdmin(chatId, userId))) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⛔ Only group administrators can perform this action.',
+          show_alert: true
+        });
+      }
+
+      const job = await Job.findById(jobId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
+      }
+
+      const confirmMsg = `⚠️ <b>Confirm Deletion</b>
+
+Are you sure you want to delete the opportunity:
+<b>${escapeHTML(job.company)} - ${escapeHTML(job.role)}</b>?
+
+This will permanently delete the opportunity, its response stats, and all pending reminders.`;
+
+      const inlineKeyboard = [
+        [
+          { text: '🗑️ Confirm Delete', callback_data: `delete_confirm:${jobId}:${optType}` },
+          { text: '❌ Cancel', callback_data: `view_job:${jobId}:${optType}` }
+        ]
+      ];
+
+      await bot.editMessageText(confirmMsg, {
+        chat_id: chatId,
+        message_id: msg.message_id,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: inlineKeyboard }
+      });
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data.startsWith('delete_confirm:')) {
+      const parts = data.split(':');
+      const jobId = parts[1];
+
+      // Admin verification
+      if (!(await checkAdmin(chatId, userId))) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⛔ Only group administrators can perform this action.',
+          show_alert: true
+        });
+      }
+
+      const job = await Job.findById(jobId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
+      }
+
+      await Job.deleteOne({ _id: job._id });
+      await PollResponse.deleteMany({ jobId: job._id });
+      await Reminder.deleteMany({ jobId: job._id });
+
+      await bot.editMessageText(`✅ Successfully deleted opportunity: <b>${escapeHTML(job.company)} - ${escapeHTML(job.role)}</b>`, {
+        chat_id: chatId,
+        message_id: msg.message_id,
+        parse_mode: 'HTML'
+      });
+      await bot.answerCallbackQuery(callbackQuery.id, { text: 'Opportunity deleted.' });
+
+    } else if (data.startsWith('edit_deadline_prompt:')) {
+      const parts = data.split(':');
+      const jobId = parts[1];
+      const optType = parts[2] || '';
+
+      // Admin verification
+      if (!(await checkAdmin(chatId, userId))) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⛔ Only group administrators can perform this action.',
+          show_alert: true
+        });
+      }
+
+      const job = await Job.findById(jobId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
+      }
+
+      const editMsg = `📅 <b>Edit Deadline:</b>
+
+To edit the deadline for <b>${escapeHTML(job.company)} - ${escapeHTML(job.role)}</b>, copy the command below (tap to copy), adjust the date and time, and send it to the chat:
+
+<code>/editdeadline ${jobId} YYYY-MM-DD HH:MM</code>
+
+<i>Example:</i> <code>/editdeadline ${jobId} 2026-06-20 23:59</code>`;
+
+      const inlineKeyboard = [
+        [{ text: '⬅️ Back to Details', callback_data: `view_job:${jobId}:${optType}` }]
+      ];
+
+      await bot.editMessageText(editMsg, {
+        chat_id: chatId,
+        message_id: msg.message_id,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: inlineKeyboard }
+      });
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data.startsWith('back_to_list:')) {
+      const parts = data.split(':');
+      const optType = parts[1] || null;
+
+      await sendOpportunityList(chatId, optType, msg.message_id);
+      await bot.answerCallbackQuery(callbackQuery.id);
+    }
+  } catch (err) {
+    logger.error('Error in callback query handler: %s', err.stack);
+    try {
+      await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ An error occurred processing this request.', show_alert: true });
+    } catch (_) {}
   }
 });
 
