@@ -5,6 +5,7 @@ const Group = require('../models/Group');
 const Reminder = require('../models/Reminder');
 const { extractJobDetails } = require('./ai');
 const logger = require('../utils/logger');
+const { fetchPageContent, isBareLink } = require('../utils/scraper');
 
 const https = require('https');
 
@@ -50,6 +51,19 @@ if (!token) {
 }
 
 const bot = new TelegramBot(token || 'dummy-token', { polling: true });
+
+// Register slash commands menu globally with Telegram
+bot.setMyCommands([
+  { command: 'jobs', description: 'Display active opportunities' },
+  { command: 'jobstats', description: 'Show application stats for a job' },
+  { command: 'pending', description: 'Show users who haven\'t applied' },
+  { command: 'closed', description: 'Show archived/closed opportunities' },
+  { command: 'help', description: 'Display help message' }
+]).then(() => {
+  logger.info('Telegram Bot commands menu registered successfully.');
+}).catch(err => {
+  logger.error('Failed to register Telegram Bot commands menu: %s', err.message);
+});
 
 // Store active command contexts or tracking flags if needed
 logger.info('Telegram Bot initialized and polling started.');
@@ -343,10 +357,10 @@ async function sendOpportunityList(chatId, opportunityType = null) {
 // ----------------------------------------------------
 
 // /help
-bot.onText(/^\/help$/, async (msg) => {
+bot.onText(/^\/help$|^❓ Get Help$/, async (msg) => {
   const chatId = msg.chat.id;
   const botUser = await bot.getMe();
-  const helpText = `<b>JobPulse Bot Commands:</b>
+  const helpText = `<b>JobClaw Bot Commands:</b>
 
 👥 <b>Public Commands:</b>
 • /opportunities - Display all active opportunities
@@ -378,12 +392,26 @@ bot.onText(/^\/start$/, async (msg) => {
   const chatId = msg.chat.id;
   if (msg.chat.type === 'private') {
     const welcome = `👋 Hello ${escapeHTML(msg.from.first_name || 'there')}!
-I am <b>JobPulse</b>, the AI job tracking bot. 
+I am <b>JobClaw</b>, the AI job tracking bot. 
 
 By starting me here, you have enabled <b>Direct Message Reminders</b> for jobs, hackathons, and competitions posted in your placement groups. I will send you reminders before deadlines if you haven't applied or registered!
 
 To list opportunities in your groups, use the bot commands in your group chats. Type /help to see all commands.`;
-    await bot.sendMessage(chatId, welcome, { parse_mode: 'HTML' });
+    
+    // Add persistent Reply Keyboard for DMs
+    const keyboard = {
+      keyboard: [
+        [{ text: '💼 Active Jobs' }, { text: '📁 Closed Jobs' }],
+        [{ text: '❓ Get Help' }]
+      ],
+      resize_keyboard: true,
+      persistent: true
+    };
+
+    await bot.sendMessage(chatId, welcome, {
+      parse_mode: 'HTML',
+      reply_markup: keyboard
+    });
   } else {
     await bot.sendMessage(chatId, 'Bot is active! Send /help to see available commands.');
   }
@@ -401,7 +429,7 @@ bot.onText(/^\/opportunities$/, async (msg) => {
 });
 
 // /jobs
-bot.onText(/^\/jobs$/, async (msg) => {
+bot.onText(/^\/jobs$|^💼 Active Jobs$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
     await sendOpportunityList(chatId, 'job');
@@ -434,7 +462,7 @@ bot.onText(/^\/competitions$/, async (msg) => {
 });
 
 // /closed
-bot.onText(/^\/closed$/, async (msg) => {
+bot.onText(/^\/closed$|^📁 Closed Jobs$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
     const closedJobs = await Job.find({
@@ -484,7 +512,7 @@ bot.onText(/^\/jobstats(?:\s+(.+))?$/, async (msg, match) => {
     const group = await Group.findOne({ telegramGroupId: chatId });
     const totalMembers = group ? group.members.length : 0;
     const respondedUserIds = new Set(responses.map(r => r.userId));
-    
+
     // Group members who have not responded
     const noResponseCount = Math.max(0, totalMembers - respondedUserIds.size);
 
@@ -529,7 +557,7 @@ bot.onText(/^\/pending(?:\s+(.+))?$/, async (msg, match) => {
     const meta = getOpportunityMeta(job);
     const responses = await PollResponse.find({ jobId: job._id });
     const votedNoUsernames = responses.filter(r => r.response === 'no').map(r => r.username ? `@${r.username}` : `User(${r.userId})`);
-    
+
     // Get no-response users
     const group = await Group.findOne({ telegramGroupId: chatId });
     const respondedUserIds = new Set(responses.map(r => r.userId));
@@ -552,7 +580,7 @@ bot.onText(/^\/pending(?:\s+(.+))?$/, async (msg, match) => {
 ${votedNoUsernames.length > 0 ? escapeHTML(votedNoUsernames.join('\n')) : '<i>None</i>' }
 
 ❔ <b>No Response (${noResponseUsernames.length}):</b>
-${noResponseUsernames.length > 0 ? escapeHTML(noResponseUsernames.join('\n')) : '<i>None</i>' }`;
+${noResponseUsernames.length > 0 ? escapeHTML(noResponseUsernames.join('\n')) : '<i>None</i>'}`;
 
     await bot.sendMessage(chatId, responseMsg, { parse_mode: 'HTML' });
   } catch (err) {
@@ -806,10 +834,37 @@ bot.onText(/^\/forcepoll(?:\s+([\s\S]+))?$/, async (msg, match) => {
   }
 
   const processingMsg = await bot.sendMessage(chatId, '🤖 Processing text with Gemini AI...');
-  
+
   try {
-    const jobList = await extractJobDetails(jobText);
-    
+    const urlRegex = /(https?:\/\/[^\s]+)/g;
+    const urls = jobText.match(urlRegex) || [];
+    const resolvedUrls = [];
+    for (const url of urls) {
+      const expanded = await expandUrl(url);
+      resolvedUrls.push(expanded);
+    }
+
+    let processedText = jobText;
+    urls.forEach((url, i) => {
+      processedText = processedText.replace(url, resolvedUrls[i]);
+    });
+
+    let webpageContexts = [];
+    if (isBareLink(processedText, resolvedUrls)) {
+      logger.info('Forcepoll text is identified as a bare link. Scraping webpage contents...');
+      const fetchPromises = resolvedUrls.map(async (url) => {
+        const content = await fetchPageContent(url);
+        if (content) {
+          return { url, content };
+        }
+        return null;
+      });
+      const results = await Promise.all(fetchPromises);
+      webpageContexts = results.filter(r => r !== null);
+    }
+
+    const jobList = await extractJobDetails(processedText, webpageContexts);
+
     if (!jobList || jobList.length === 0) {
       return await bot.editMessageText('❌ Failed to extract any valid opportunity details or find application links in the provided text.', {
         chat_id: chatId,
@@ -818,7 +873,7 @@ bot.onText(/^\/forcepoll(?:\s+([\s\S]+))?$/, async (msg, match) => {
     }
 
     await bot.deleteMessage(chatId, processingMsg.message_id);
-    
+
     for (const jobDetails of jobList) {
       await createJobAndPoll(chatId, jobDetails, msg.message_id);
     }
@@ -845,7 +900,7 @@ bot.onText(/^\/broadcast(?:\s+([\s\S]+))?$/, async (msg, match) => {
   try {
     const groups = await Group.find({});
     let successCount = 0;
-    
+
     for (const group of groups) {
       try {
         await bot.sendMessage(group.telegramGroupId, `📢 <b>Broadcast Message:</b>\n\n${escapeHTML(broadcastMsg)}`, { parse_mode: 'HTML' });
@@ -854,7 +909,7 @@ bot.onText(/^\/broadcast(?:\s+([\s\S]+))?$/, async (msg, match) => {
         logger.warn('Failed to send broadcast to group %d: %s', group.telegramGroupId, err.message);
       }
     }
-    
+
     await bot.sendMessage(chatId, `✅ Broadcast sent successfully to ${successCount}/${groups.length} groups.`);
   } catch (err) {
     logger.error('Error in /broadcast: %s', err.stack);
@@ -874,7 +929,7 @@ async function createJobAndPoll(chatId, jobDetails, originalMessageId) {
     const meta = getOpportunityMeta(jobDetails);
     // Normal duplicate check by normalized URL and Company
     const normalizedUrl = normalizeUrl(jobDetails.applyLink);
-    
+
     const existingJob = await Job.findOne({
       telegramGroupId: chatId,
       applyLink: normalizedUrl,
@@ -955,7 +1010,7 @@ ${footerText}`;
 bot.on('message', async (msg) => {
   // Ignore bots or private commands (commands are handled by command handlers)
   if (msg.from && msg.from.is_bot) return;
-  
+
   const text = msg.text || msg.caption;
   if (!text) return;
 
@@ -978,7 +1033,6 @@ bot.on('message', async (msg) => {
 
   if (urls && urls.length > 0) {
     logger.info('Detected potential opportunity post in group %d...', chatId);
-    
     // Resolve short URLs first to expand bit.ly, tinyurl, etc.
     const resolvedUrls = [];
     for (const url of urls) {
@@ -1012,8 +1066,24 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    // Process with AI
-    const jobList = await extractJobDetails(processedText);
+    // Process with AI (conditionally scraping webpage contents)
+    let webpageContexts = [];
+    if (isBareLink(processedText, resolvedUrls)) {
+      logger.info('Message is identified as a bare link. Scraping webpage contents...');
+      const fetchPromises = resolvedUrls.map(async (url) => {
+        const content = await fetchPageContent(url);
+        if (content) {
+          return { url, content };
+        }
+        return null;
+      });
+      const results = await Promise.all(fetchPromises);
+      webpageContexts = results.filter(r => r !== null);
+    } else {
+      logger.info('Message has sufficient context. Skipping webpage scraping.');
+    }
+
+    const jobList = await extractJobDetails(processedText, webpageContexts);
     if (jobList && jobList.length > 0) {
       for (const jobDetails of jobList) {
         await createJobAndPoll(chatId, jobDetails, msg.message_id);
@@ -1062,7 +1132,7 @@ bot.on('poll_answer', async (answer) => {
       // User voted (0 is Yes, 1 is No)
       const vote = answer.option_ids[0] === 0 ? 'yes' : 'no';
       logger.info('User %d (%s) voted "%s" for job %s', userId, username, vote, job._id);
-      
+
       await PollResponse.findOneAndUpdate(
         { jobId: job._id, userId: userId },
         {
@@ -1079,7 +1149,6 @@ bot.on('poll_answer', async (answer) => {
         const dmText = vote === 'yes'
           ? `✅ <b>${escapeHTML(meta.yesLabel)}:</b> <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)}\nReminders disabled. Good luck! 🚀`
           : `⏰ <b>${escapeHTML(meta.noLabel)}:</b> <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)}\nI'll remind you before the deadline. ⏰`;
-        
         await bot.sendMessage(userId, dmText, { parse_mode: 'HTML' });
       } catch (dmErr) {
         logger.warn('Could not send instant DM vote confirmation to user %d: %s', userId, dmErr.message);

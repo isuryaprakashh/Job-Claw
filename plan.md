@@ -1,8 +1,8 @@
-# PRD: JobPulse - AI-Powered Telegram Job Tracking Bot
+# PRD: JobClaw - AI-Powered Telegram Job Tracking Bot
 
 ## Product Overview
 
-JobPulse is an AI-powered Telegram bot that helps placement groups track job applications.
+JobClaw is an AI-powered Telegram bot that helps placement groups track job applications.
 
 Whenever a job opportunity is posted in a Telegram group, the bot automatically:
 
@@ -27,7 +27,7 @@ Placement groups often face the following issues:
 * Placement coordinators manually follow up.
 * Students forget to apply despite seeing opportunities.
 
-JobPulse automates the entire process.
+JobClaw automates the entire process.
 
 ---
 

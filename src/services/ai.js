@@ -11,9 +11,10 @@ const genAI = new GoogleGenerativeAI(apiKey || 'dummy-key');
 /**
  * Parses raw opportunity post content using Gemini AI, extracting a list of opportunity details.
  * @param {string} textContent The raw message content from Telegram.
+ * @param {Array<object>} webpageContexts Scraped contents of the links in the message.
  * @returns {Promise<Array<object>>} A list of parsed opportunity metadata objects.
  */
-async function extractJobDetails(textContent) {
+async function extractJobDetails(textContent, webpageContexts = []) {
   try {
     let modelName = 'gemini-2.5-flash';
     let model;
@@ -27,7 +28,7 @@ async function extractJobDetails(textContent) {
 
     const currentYear = new Date().getFullYear();
     const systemPrompt = `You are an opportunity extraction engine for student communities.
-Your task is to analyze the user's message and extract all valid jobs, internships, hackathons, coding contests, case competitions, business competitions, challenges, ideathons, quizzes, and similar student opportunities present.
+Your task is to analyze the user's message (and any provided webpage content) and extract all valid jobs, internships, hackathons, coding contests, case competitions, business competitions, challenges, ideathons, quizzes, and similar student opportunities present.
 For each opportunity, extract:
 - opportunityType (must be exactly one of: "job", "hackathon", "competition". Use "job" for jobs and internships, "hackathon" for hackathons/buildathons, and "competition" for coding contests, case competitions, quizzes, challenges, ideathons, or other competitive events)
 - company (for jobs: company name. For hackathons/competitions: organizer, host, platform, or sponsor name)
@@ -43,10 +44,17 @@ For each opportunity, extract:
 
 Return a JSON array of objects containing these keys. If no valid opportunities are found, return an empty array []. Do not include any formatting, markdown markers, or chat text outside the JSON.`;
 
-    const prompt = `Raw Opportunity Posting Content:
+    let prompt = `Raw Opportunity Posting Content:
 """
 ${textContent}
 """`;
+
+    if (webpageContexts && webpageContexts.length > 0) {
+      prompt += `\n\nAdditionally, here is the scraped webpage content from the linked opportunity pages to help you extract accurate company, role, deadline, location, batch requirements, etc.:`;
+      webpageContexts.forEach((ctx, index) => {
+        prompt += `\n\n--- Link [${index + 1}] (${ctx.url}) ---\n${ctx.content}\n--- End Link [${index + 1}] ---`;
+      });
+    }
 
     // Define JSON schema for structured output to ensure consistency
     const jsonSchema = {

@@ -2,8 +2,8 @@ const mongoose = require('mongoose');
 const logger = require('../utils/logger');
 
 const connectDB = async () => {
-  const uri = process.env.MONGODB_URI || process.env.MONGO_DB_URI || 'mongodb://localhost:27017/jobpulse';
-  
+  const uri = process.env.MONGODB_URI || process.env.MONGO_DB_URI || 'mongodb://localhost:27017/JobClaw';
+
   try {
     logger.info('Connecting to MongoDB...');
     await mongoose.connect(uri);
