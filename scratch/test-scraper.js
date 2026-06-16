@@ -1,4 +1,4 @@
-const { fetchPageContent, isBareLink } = require('../src/utils/scraper');
+const { fetchPageContent, isBareLink, parseMetadataDirectly } = require('../src/utils/scraper');
 const logger = require('../src/utils/logger');
 
 async function runTests() {
@@ -33,6 +33,51 @@ Apply ASAP!`;
     logger.info(`"""\n${content.substring(0, 300)}\n"""`);
   } else {
     logger.error(`Failed to fetch ${testUrl}`);
+  }
+
+  // Test 3: parseMetadataDirectly
+  logger.info('\nTest 3: parseMetadataDirectly checks');
+  logger.info(`Testing direct parser with ${testUrl} (should return null as it is not a job portal)...`);
+  const metaResult = await parseMetadataDirectly(testUrl);
+  logger.info(`Result: ${JSON.stringify(metaResult)} (Expected: null)`);
+
+  // Test 3A: LinkedIn Style (Role at Company)
+  const linkedinDataUri = 'data:text/html;charset=utf-8,' + encodeURIComponent(
+    '<html><head><title>Software Engineer Intern at Microsoft</title><meta property="og:title" content="Software Engineer Intern at Microsoft"></head></html>'
+  );
+  logger.info('Testing direct parser with LinkedIn style (Role at Company)...');
+  const linkedinMeta = await parseMetadataDirectly(linkedinDataUri);
+  logger.info(`LinkedIn style Result: ${JSON.stringify(linkedinMeta)}`);
+  if (linkedinMeta && linkedinMeta.company === 'Microsoft' && linkedinMeta.role === 'Software Engineer Intern') {
+    logger.info('✅ LinkedIn style test passed!');
+  } else {
+    logger.error('❌ LinkedIn style test failed!');
+  }
+
+  // Test 3B: Lever Style (Company - Role)
+  const leverDataUri = 'data:text/html;charset=utf-8,' + encodeURIComponent(
+    '<html><head><title>Netflix - Software Engineer Intern</title><meta property="og:title" content="Netflix - Software Engineer Intern"><meta property="og:site_name" content="Netflix"></head></html>'
+  );
+  logger.info('Testing direct parser with Lever style (Company - Role)...');
+  const leverMeta = await parseMetadataDirectly(leverDataUri);
+  logger.info(`Lever style Result: ${JSON.stringify(leverMeta)}`);
+  if (leverMeta && leverMeta.company === 'Netflix' && leverMeta.role === 'Software Engineer Intern') {
+    logger.info('✅ Lever style test passed!');
+  } else {
+    logger.error('❌ Lever style test failed!');
+  }
+
+  // Test 3C: Greenhouse Style (Role - Company)
+  const greenhouseDataUri = 'data:text/html;charset=utf-8,' + encodeURIComponent(
+    '<html><head><title>Software Engineer - Google</title><meta property="og:title" content="Software Engineer - Google"><meta property="og:site_name" content="Google"></head></html>'
+  );
+  logger.info('Testing direct parser with Greenhouse style (Role - Company)...');
+  const greenhouseMeta = await parseMetadataDirectly(greenhouseDataUri);
+  logger.info(`Greenhouse style Result: ${JSON.stringify(greenhouseMeta)}`);
+  if (greenhouseMeta && greenhouseMeta.company === 'Google' && greenhouseMeta.role === 'Software Engineer') {
+    logger.info('✅ Greenhouse style test passed!');
+  } else {
+    logger.error('❌ Greenhouse style test failed!');
   }
 
   logger.info('=== SCRAPER TESTS COMPLETED ===');

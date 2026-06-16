@@ -71,6 +71,10 @@ const jobSchema = new mongoose.Schema({
     type: String,
     enum: ['active', 'closed', 'archived'],
     default: 'active'
+  },
+  jobIndex: {
+    type: Number,
+    index: true
   }
 }, {
   timestamps: true

@@ -107,7 +107,195 @@ function isBareLink(text, urls) {
   return cleanText.length < 60;
 }
 
+/**
+ * Helper to parse a single title candidate for company, role and opportunity type.
+ */
+function parseTitleCandidate(titleCandidate, ogSiteName, url) {
+  if (!titleCandidate) return null;
+
+  // Decode basic HTML entities in title Candidate
+  let decodedTitle = titleCandidate
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+
+  let company = '';
+  let role = '';
+  let opportunityType = 'job'; // Default
+
+  const lowUrl = url.toLowerCase();
+  const lowTitle = decodedTitle.toLowerCase();
+
+  // Determine opportunity type
+  if (lowUrl.includes('hackathon') || lowTitle.includes('hackathon')) {
+    opportunityType = 'hackathon';
+  } else if (
+    lowUrl.includes('contest') || lowTitle.includes('contest') ||
+    lowUrl.includes('competition') || lowTitle.includes('competition') ||
+    lowUrl.includes('challenge') || lowTitle.includes('challenge') ||
+    lowTitle.includes('ideathon') || lowTitle.includes('quiz')
+  ) {
+    opportunityType = 'competition';
+  }
+
+  // Heuristic patterns:
+  // Pattern A: "Role @ Company" or "Role at Company"
+  const atMatch = decodedTitle.match(/^([\s\S]+?)\s+@\s+([\s\S]+)$/i) || 
+                  decodedTitle.match(/^([\s\S]+?)\s+at\s+([\s\S]+)$/i);
+  if (atMatch) {
+    role = atMatch[1].trim();
+    company = atMatch[2].trim();
+  } else {
+    // Pattern B: "Company - Role" or "Role - Company"
+    const dashParts = decodedTitle.split(/\s+-\s+|\s+\|\s+|\s+::\s+/);
+    if (dashParts.length >= 2) {
+      const first = dashParts[0].trim();
+      const second = dashParts[1].trim();
+
+      if (ogSiteName && second.toLowerCase().includes(ogSiteName.toLowerCase())) {
+        role = first;
+        company = second;
+      } else if (ogSiteName && first.toLowerCase().includes(ogSiteName.toLowerCase())) {
+        role = second;
+        company = first;
+      } else {
+        role = first;
+        company = second;
+      }
+    }
+  }
+
+  // Strip common garbage suffix from company or role
+  if (company) {
+    company = company
+      .replace(/careers|jobs|job board|hiring portal|job portal|linkedin|lever|greenhouse|ashby|ashbyhq/gi, '')
+      .replace(/^[\s\-\|]+|[\s\-\|]+$/g, '')
+      .trim();
+  }
+  if (role) {
+    role = role
+      .replace(/job description|careers|jobs/gi, '')
+      .replace(/^[\s\-\|]+|[\s\-\|]+$/g, '')
+      .trim();
+  }
+
+  if (company && role && company.length >= 2 && role.length >= 3 && company.length < 50 && role.length < 100) {
+    return { company, role, opportunityType };
+  }
+
+  return null;
+}
+
+/**
+ * Tries to parse opportunity metadata directly from webpage HTML without AI.
+ * @param {string} url The opportunity URL.
+ * @returns {Promise<object|null>} The opportunity details, or null if direct parsing fails/is not confident.
+ */
+async function parseMetadataDirectly(url) {
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+
+    if (!response.ok) return null;
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('text/html')) return null;
+
+    const html = await response.text();
+
+    // 1. Extract potential titles
+    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const htmlTitle = titleMatch ? titleMatch[1].trim() : '';
+
+    const ogTitleMatch = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i) ||
+                         html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i);
+    const ogTitle = ogTitleMatch ? ogTitleMatch[1].trim() : '';
+
+    const nameTitleMatch = html.match(/<meta[^>]+name=["']title["'][^>]+content=["']([^"']+)["']/i) ||
+                           html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']title["']/i);
+    const nameTitle = nameTitleMatch ? nameTitleMatch[1].trim() : '';
+
+    const twitterTitleMatch = html.match(/<meta[^>]+name=["']twitter:title["'][^>]+content=["']([^"']+)["']/i) ||
+                              html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:title["']/i);
+    const twitterTitle = twitterTitleMatch ? twitterTitleMatch[1].trim() : '';
+
+    const ogSiteNameMatch = html.match(/<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i) ||
+                            html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:site_name["']/i);
+    const ogSiteName = ogSiteNameMatch ? ogSiteNameMatch[1].trim() : '';
+
+    const ogDescMatch = html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i) ||
+                        html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i) ||
+                        html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
+    const ogDesc = ogDescMatch ? ogDescMatch[1].trim() : '';
+
+    // Test candidates in order of richness
+    const candidates = [nameTitle, htmlTitle, twitterTitle, ogTitle];
+    let parseResult = null;
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      parseResult = parseTitleCandidate(candidate, ogSiteName, url);
+      if (parseResult) break;
+    }
+
+    if (parseResult) {
+      // Parse location heuristics from description
+      let location = '';
+      const lowTitle = (nameTitle + ' ' + htmlTitle + ' ' + ogTitle).toLowerCase();
+      const lowDesc = ogDesc.toLowerCase();
+
+      if (lowTitle.includes('remote') || lowDesc.includes('remote')) {
+        location = 'Remote';
+      } else if (lowTitle.includes('online') || lowDesc.includes('online')) {
+        location = 'Online';
+      } else {
+        const locations = ['bangalore', 'bengaluru', 'noida', 'gurgaon', 'gurugram', 'hyderabad', 'pune', 'mumbai', 'chennai'];
+        for (const loc of locations) {
+          if (lowDesc.includes(loc) || lowTitle.includes(loc)) {
+            location = loc.charAt(0).toUpperCase() + loc.slice(1);
+            break;
+          }
+        }
+      }
+
+      // Try to extract batch eligibility
+      let batchEligibility = '';
+      const batchMatch = ogDesc.match(/\b(202[4-8])\b/);
+      if (batchMatch) {
+        batchEligibility = `${batchMatch[1]} Batch`;
+      }
+
+      return {
+        opportunityType: parseResult.opportunityType,
+        company: parseResult.company,
+        role: parseResult.role,
+        applyLink: url,
+        deadline: null,
+        location,
+        salary: '',
+        batchEligibility,
+        prize: '',
+        eventDate: null,
+        format: ''
+      };
+    }
+
+    return null;
+  } catch (err) {
+    logger.warn(`Direct metadata parsing failed for ${url}: ${err.message}`);
+    return null;
+  }
+}
+
 module.exports = {
   fetchPageContent,
-  isBareLink
+  isBareLink,
+  parseMetadataDirectly
 };

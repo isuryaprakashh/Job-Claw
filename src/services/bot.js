@@ -5,7 +5,7 @@ const Group = require('../models/Group');
 const Reminder = require('../models/Reminder');
 const { extractJobDetails } = require('./ai');
 const logger = require('../utils/logger');
-const { fetchPageContent, isBareLink } = require('../utils/scraper');
+const { fetchPageContent, isBareLink, parseMetadataDirectly } = require('../utils/scraper');
 
 const https = require('https');
 
@@ -65,6 +65,11 @@ bot.setMyCommands([
   logger.error('Failed to register Telegram Bot commands menu: %s', err.message);
 });
 
+// Run migration to assign jobIndex to existing jobs
+migrateJobIndices().catch(err => {
+  logger.error('Failed to run job index migration: %s', err.stack);
+});
+
 // Store active command contexts or tracking flags if needed
 logger.info('Telegram Bot initialized and polling started.');
 
@@ -74,20 +79,65 @@ bot.on('channel_post', (msg) => {
 });
 
 /**
- * Helper to check if a user is admin of the group
+ * Helper to check if a user is admin of the group (or a target group if called from DM)
  */
-async function checkAdmin(chatId, userId) {
-  if (chatId > 0) return true; // Private chats have no group admins
+async function checkAdmin(chatId, userId, targetGroupId = null) {
+  const effectiveGroupId = (chatId > 0 && targetGroupId) ? targetGroupId : chatId;
+  if (effectiveGroupId > 0) return true; // Private chats have no group admins
   try {
-    const admins = await bot.getChatAdministrators(chatId);
+    const admins = await bot.getChatAdministrators(effectiveGroupId);
     return admins.some(member => member.user.id === userId);
   } catch (err) {
-    logger.warn('Error checking Telegram admins for chat %d: %s. Fallback to DB check.', chatId, err.message);
-    const group = await Group.findOne({ telegramGroupId: chatId });
+    logger.warn('Error checking Telegram admins for chat %d: %s. Fallback to DB check.', effectiveGroupId, err.message);
+    const group = await Group.findOne({ telegramGroupId: effectiveGroupId });
     if (group && group.admins.includes(userId)) {
       return true;
     }
     return false;
+  }
+}
+
+/**
+ * Synchronizes the user's membership across all known groups
+ */
+async function syncUserGroups(userId) {
+  try {
+    const groups = await Group.find({});
+    for (const group of groups) {
+      // Check if user is already in group.members
+      const isRegistered = group.members.some(m => m.userId === userId);
+      if (isRegistered) continue;
+
+      // If not registered, check Telegram API
+      try {
+        const member = await bot.getChatMember(group.telegramGroupId, userId);
+        const activeStatuses = ['creator', 'administrator', 'member', 'restricted'];
+        if (member && activeStatuses.includes(member.status)) {
+          // Add them atomically
+          await Group.findOneAndUpdate(
+            { 
+              telegramGroupId: group.telegramGroupId,
+              'members.userId': { $ne: userId }
+            },
+            {
+              $push: {
+                members: {
+                  userId: userId,
+                  username: member.user.username || '',
+                  firstName: member.user.first_name || '',
+                  lastName: member.user.last_name || ''
+                }
+              }
+            }
+          );
+          logger.info('Dynamically registered user %d in group %d via sync', userId, group.telegramGroupId);
+        }
+      } catch (err) {
+        // Ignore errors (e.g., bot kicked or user not found)
+      }
+    }
+  } catch (err) {
+    logger.error('Error in syncUserGroups: %s', err.stack);
   }
 }
 
@@ -101,37 +151,72 @@ async function registerUserAndGroup(msg) {
   try {
     let group = await Group.findOne({ telegramGroupId: chatId });
     if (!group) {
-      group = new Group({
-        telegramGroupId: chatId,
-        groupName: isGroup ? (msg.chat.title || '') : `${msg.from.first_name || ''} ${msg.from.last_name || ''}`.trim(),
-        admins: isGroup ? [] : [msg.from.id]
-      });
+      let groupAdmins = [];
       if (isGroup) {
-        // Load initial administrators asynchronously
-        bot.getChatAdministrators(chatId).then(admins => {
-          group.admins = admins.map(a => a.user.id);
-          group.save().catch(e => logger.error('Error saving group admins: %s', e.message));
-        }).catch(e => logger.warn('Could not load administrators initially: %s', e.message));
+        try {
+          const admins = await bot.getChatAdministrators(chatId);
+          groupAdmins = admins.map(a => a.user.id);
+        } catch (e) {
+          logger.warn('Could not load administrators initially: %s', e.message);
+        }
+      } else {
+        groupAdmins = [msg.from.id];
       }
+
+      group = await Group.findOneAndUpdate(
+        { telegramGroupId: chatId },
+        {
+          $setOnInsert: {
+            telegramGroupId: chatId,
+            groupName: isGroup ? (msg.chat.title || '') : `${msg.from.first_name || ''} ${msg.from.last_name || ''}`.trim(),
+            admins: groupAdmins,
+            members: []
+          }
+        },
+        { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
+      );
     }
 
     const sender = msg.from;
     if (sender && !sender.is_bot) {
-      const exists = group.members.some(m => m.userId === sender.id);
-      if (!exists) {
-        group.members.push({
-          userId: sender.id,
-          username: sender.username || '',
-          firstName: sender.first_name || '',
-          lastName: sender.last_name || ''
-        });
+      // 1. Try to update name/username if the member already exists
+      const updated = await Group.findOneAndUpdate(
+        { 
+          telegramGroupId: chatId, 
+          'members.userId': sender.id 
+        },
+        { 
+          $set: { 
+            'members.$.username': sender.username || '',
+            'members.$.firstName': sender.first_name || '',
+            'members.$.lastName': sender.last_name || ''
+          } 
+        },
+        { returnDocument: 'after' }
+      );
+
+      // 2. If member did not exist, push atomically
+      if (!updated) {
+        group = await Group.findOneAndUpdate(
+          { 
+            telegramGroupId: chatId,
+            'members.userId': { $ne: sender.id } 
+          },
+          {
+            $push: {
+              members: {
+                userId: sender.id,
+                username: sender.username || '',
+                firstName: sender.first_name || '',
+                lastName: sender.last_name || ''
+              }
+            }
+          },
+          { returnDocument: 'after' }
+        );
       } else {
-        const member = group.members.find(m => m.userId === sender.id);
-        if (member.username !== (sender.username || '')) {
-          member.username = sender.username || '';
-        }
+        group = updated;
       }
-      await group.save();
     }
     return group;
   } catch (err) {
@@ -161,23 +246,89 @@ function normalizeUrl(urlStr) {
 }
 
 /**
+ * Backfills sequential jobIndex values for existing jobs in each Telegram group
+ */
+async function migrateJobIndices() {
+  logger.info('Starting Telegram job index migration...');
+  const groups = await Job.distinct('telegramGroupId');
+  let migratedCount = 0;
+  for (const groupId of groups) {
+    const jobs = await Job.find({ telegramGroupId: groupId }).sort({ createdAt: 1 });
+    for (let i = 0; i < jobs.length; i++) {
+      if (jobs[i].jobIndex === undefined || jobs[i].jobIndex === null) {
+        jobs[i].jobIndex = i + 1;
+        await jobs[i].save();
+        migratedCount++;
+      }
+    }
+  }
+  if (migratedCount > 0) {
+    logger.info('Job index migration completed. Migrated %d jobs.', migratedCount);
+  } else {
+    logger.info('Job index migration completed. No jobs needed migration.');
+  }
+}
+
+/**
  * Finds a job using reference string (index in list or mongo ID)
  */
-async function findJobByRef(chatId, jobRef, statusFilter = {}) {
+async function findJobByRef(chatId, jobRef, statusFilter = {}, userId = null) {
   const cleanRef = jobRef.trim();
+  let groupQuery = { telegramGroupId: chatId };
+
+  // If called in DMs, find jobs across all groups the user belongs to
+  if (chatId > 0 && userId) {
+    const userGroups = await Group.find({ 'members.userId': userId });
+    const groupIds = userGroups.map(g => g.telegramGroupId);
+    groupQuery = { telegramGroupId: { $in: groupIds } };
+  }
 
   // If it's a valid MongoDB ObjectId
   if (/^[0-9a-fA-F]{24}$/.test(cleanRef)) {
-    return await Job.findOne({ _id: cleanRef, telegramGroupId: chatId });
+    return await Job.findOne({ _id: cleanRef, ...groupQuery, ...statusFilter });
   }
 
   // If it's a number (index)
   const index = parseInt(cleanRef, 10);
   if (!isNaN(index) && index > 0) {
-    const query = { telegramGroupId: chatId, ...statusFilter };
-    const jobs = await Job.find(query).sort({ createdAt: 1 });
-    if (index <= jobs.length) {
-      return jobs[index - 1];
+    if (chatId > 0 && userId) {
+      // Sync membership in background
+      syncUserGroups(userId).catch(err => logger.error('Error in background syncUserGroups: %s', err.stack));
+
+      const userGroups = await Group.find({ 'members.userId': userId });
+      const groupIds = userGroups.map(g => g.telegramGroupId);
+
+      // Check if closed status filter is requested
+      const isClosedRequest = statusFilter.status && (
+        statusFilter.status === 'closed' ||
+        statusFilter.status === 'archived' ||
+        (statusFilter.status.$in && (statusFilter.status.$in.includes('closed') || statusFilter.status.$in.includes('archived')))
+      );
+
+      const query = {
+        telegramGroupId: { $in: groupIds },
+        status: isClosedRequest ? { $in: ['closed', 'archived'] } : 'active'
+      };
+
+      const jobs = await Job.find(query).sort({ createdAt: isClosedRequest ? -1 : 1 });
+      if (index <= jobs.length) {
+        return jobs[index - 1];
+      }
+
+      // If no status filter was explicitly requested and active lookup failed, fallback to closed jobs
+      if (!statusFilter.status) {
+        const closedQuery = {
+          telegramGroupId: { $in: groupIds },
+          status: { $in: ['closed', 'archived'] }
+        };
+        const closedJobs = await Job.find(closedQuery).sort({ createdAt: -1 });
+        if (index <= closedJobs.length) {
+          return closedJobs[index - 1];
+        }
+      }
+      return null;
+    } else {
+      return await Job.findOne({ ...groupQuery, jobIndex: index, ...statusFilter });
     }
   }
 
@@ -188,17 +339,48 @@ function formatSettingState(enabled) {
   return enabled ? 'ON' : 'OFF';
 }
 
-async function sendSettingsSummary(chatId, group) {
+async function sendSettingsSummary(chatId, group, messageId = null) {
   const settings = group.settings || {};
-  const response = `<b>Group Settings</b>
+  const autoPollActive = settings.autoPollEnabled !== false;
+  const dmRemindersActive = settings.dmRemindersEnabled !== false;
 
-Auto job detection: <b>${formatSettingState(settings.autoPollEnabled !== false)}</b>
-DM reminders: <b>${formatSettingState(settings.dmRemindersEnabled !== false)}</b>
+  const response = `⚙️ <b>Group Control Panel</b>
 
-Use <code>/autopoll on</code> or <code>/autopoll off</code>
-Use <code>/dmreminders on</code> or <code>/dmreminders off</code>`;
+Configure the bot's automation and notification options for this group:
 
-  await bot.sendMessage(chatId, response, { parse_mode: 'HTML' });
+🤖 <b>Auto Opportunity Detection:</b> <b>${formatSettingState(autoPollActive)}</b>
+<i>Scrapes and creates application polls from group messages automatically.</i>
+
+🔔 <b>Direct Message Reminders:</b> <b>${formatSettingState(dmRemindersActive)}</b>
+<i>Sends personalized DM alerts to users before application deadlines.</i>`;
+
+  const inlineKeyboard = [
+    [
+      {
+        text: `🤖 Auto Poll: ${autoPollActive ? '🟢 ON' : '🔴 OFF'}`,
+        callback_data: 'toggle_autopoll'
+      }
+    ],
+    [
+      {
+        text: `🔔 DM Reminders: ${dmRemindersActive ? '🟢 ON' : '🔴 OFF'}`,
+        callback_data: 'toggle_dmreminders'
+      }
+    ]
+  ];
+
+  const options = {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: inlineKeyboard
+    }
+  };
+
+  if (messageId) {
+    await bot.editMessageText(response, { chat_id: chatId, message_id: messageId, ...options });
+  } else {
+    await bot.sendMessage(chatId, response, options);
+  }
 }
 
 function parseToggleValue(value) {
@@ -317,17 +499,38 @@ function getOpportunityMeta(item) {
   return meta[type];
 }
 
-async function sendOpportunityList(chatId, opportunityType = null, messageId = null) {
-  const allActiveItems = await Job.find({ telegramGroupId: chatId, status: 'active' }).sort({ createdAt: 1 });
+async function sendOpportunityList(chatId, opportunityType = null, messageId = null, isClosed = false, userId = null) {
+  let groupQuery = { telegramGroupId: chatId };
+  const isDM = chatId > 0;
+
+  // If called in DMs, query jobs from all groups this user belongs to
+  if (isDM && userId) {
+    // Sync membership in background
+    syncUserGroups(userId).catch(err => logger.error('Error in background syncUserGroups: %s', err.stack));
+
+    const userGroups = await Group.find({ 'members.userId': userId });
+    const groupIds = userGroups.map(g => g.telegramGroupId);
+    groupQuery = { telegramGroupId: { $in: groupIds } };
+  }
+
+  const query = { 
+    ...groupQuery,
+    status: isClosed ? { $in: ['closed', 'archived'] } : 'active' 
+  };
+
+  const allItems = await Job.find(query).sort({ createdAt: isClosed ? -1 : 1 });
+  
+  // Apply limit for closed opportunities to avoid massive messages
+  const itemsToProcess = isClosed ? allItems.slice(0, 15) : allItems;
+
   const activeItems = opportunityType
-    ? allActiveItems
-      .map((item, allIndex) => ({ item, allIndex }))
-      .filter(({ item }) => getOpportunityType(item) === opportunityType)
-    : allActiveItems.map((item, allIndex) => ({ item, allIndex }));
+    ? itemsToProcess.filter((item) => getOpportunityType(item) === opportunityType)
+    : itemsToProcess;
 
   if (activeItems.length === 0) {
     const emptyLabel = opportunityType ? getOpportunityMeta({ opportunityType }).plural.toLowerCase() : 'opportunities';
-    const emptyText = `📝 No active ${emptyLabel} being tracked right now.`;
+    const statusText = isClosed ? 'closed/archived' : 'active';
+    const emptyText = `📝 No ${statusText} ${emptyLabel} being tracked right now.`;
     if (messageId) {
       return await bot.editMessageText(emptyText, { chat_id: chatId, message_id: messageId });
     } else {
@@ -335,9 +538,12 @@ async function sendOpportunityList(chatId, opportunityType = null, messageId = n
     }
   }
 
-  const title = opportunityType ? getOpportunityMeta({ opportunityType }).listTitle : 'Active Opportunities';
+  const title = isClosed
+    ? (opportunityType ? `Recently Closed ${getOpportunityMeta({ opportunityType }).plural}` : 'Recently Closed Opportunities')
+    : (opportunityType ? getOpportunityMeta({ opportunityType }).listTitle : 'Active Opportunities');
+
   let response = `💼 <b>${escapeHTML(title)}:</b>\n\n`;
-  activeItems.forEach(({ item, allIndex }) => {
+  activeItems.forEach((item, index) => {
     const meta = getOpportunityMeta(item);
     const deadlineStr = item.deadline ? new Date(item.deadline).toLocaleDateString('en-IN', {
       day: 'numeric',
@@ -345,7 +551,8 @@ async function sendOpportunityList(chatId, opportunityType = null, messageId = n
       hour: '2-digit',
       minute: '2-digit'
     }) : 'No Deadline';
-    response += `${allIndex + 1}. <b>${escapeHTML(item.company)}</b> - ${escapeHTML(item.role)} <i>(${escapeHTML(meta.singular)})</i>\n`;
+    const displayNum = isDM ? (index + 1) : item.jobIndex;
+    response += `#${displayNum}. <b>${escapeHTML(item.company)}</b> - ${escapeHTML(item.role)} <i>(${escapeHTML(meta.singular)})</i>\n`;
     response += `   📅 ${escapeHTML(meta.deadlineLabel)}: <i>${escapeHTML(deadlineStr)}</i>\n`;
     if (item.eventDate) {
       response += `   🗓️ Event Date: <i>${escapeHTML(new Date(item.eventDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }))}</i>\n`;
@@ -353,12 +560,15 @@ async function sendOpportunityList(chatId, opportunityType = null, messageId = n
     response += `   🔗 <a href="${escapeHTML(item.applyLink)}">${escapeHTML(meta.linkText)}</a>\n\n`;
   });
 
-  // Build inline keyboard for active items
+  // Build inline keyboard for active/closed items
   const inlineKeyboard = [];
-  const buttons = activeItems.map(({ item, allIndex }) => ({
-    text: `${allIndex + 1}. ${item.company}`,
-    callback_data: `view_job:${item._id}:${opportunityType || ''}`
-  }));
+  const buttons = activeItems.map((item, index) => {
+    const displayNum = isDM ? (index + 1) : item.jobIndex;
+    return {
+      text: `#${displayNum}. ${item.company}`,
+      callback_data: `view_job:${item._id}:${opportunityType || ''}:${isClosed ? '1' : ''}`
+    };
+  });
 
   // Group buttons in rows of 2
   for (let i = 0; i < buttons.length; i += 2) {
@@ -417,30 +627,40 @@ bot.onText(/^\/help(?:@\w+)?$|^❓ Get Help$/, async (msg) => {
 // /start
 bot.onText(/^\/start(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
+  const keyboard = {
+    keyboard: [
+      [{ text: '💼 Active Jobs' }, { text: '📁 Closed Jobs' }],
+      [{ text: '❓ Get Help' }]
+    ],
+    resize_keyboard: true,
+    persistent: true
+  };
+
   if (msg.chat.type === 'private') {
+    const userId = msg.from.id;
+    await syncUserGroups(userId);
+
     const welcome = `👋 Hello ${escapeHTML(msg.from.first_name || 'there')}!
 I am <b>JobClaw</b>, the AI job tracking bot. 
 
 By starting me here, you have enabled <b>Direct Message Reminders</b> for jobs, hackathons, and competitions posted in your placement groups. I will send you reminders before deadlines if you haven't applied or registered!
 
 To list opportunities in your groups, use the bot commands in your group chats. Type /help to see all commands.`;
-    
-    // Add persistent Reply Keyboard for DMs
-    const keyboard = {
-      keyboard: [
-        [{ text: '💼 Active Jobs' }, { text: '📁 Closed Jobs' }],
-        [{ text: '❓ Get Help' }]
-      ],
-      resize_keyboard: true,
-      persistent: true
-    };
 
     await bot.sendMessage(chatId, welcome, {
       parse_mode: 'HTML',
       reply_markup: keyboard
     });
   } else {
-    await bot.sendMessage(chatId, 'Bot is active! Send /help to see available commands.');
+    await registerUserAndGroup(msg);
+    const welcomeGroup = `👋 Hello! I am <b>JobClaw</b>, the AI job tracking bot. 
+
+I will track opportunities posted in this group and send deadline alerts! Admin settings can be configured using /settings. Check out available commands using the menu below:`;
+
+    await bot.sendMessage(chatId, welcomeGroup, {
+      parse_mode: 'HTML',
+      reply_markup: keyboard
+    });
   }
 });
 
@@ -448,7 +668,7 @@ To list opportunities in your groups, use the bot commands in your group chats. 
 bot.onText(/^\/opportunities(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
-    await sendOpportunityList(chatId);
+    await sendOpportunityList(chatId, null, null, false, msg.from.id);
   } catch (err) {
     logger.error('Error in /opportunities command: %s', err.stack);
     await bot.sendMessage(chatId, '❌ Failed to retrieve active opportunities.');
@@ -459,7 +679,7 @@ bot.onText(/^\/opportunities(?:@\w+)?$/, async (msg) => {
 bot.onText(/^\/jobs(?:@\w+)?$|^💼 Active Jobs$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
-    await sendOpportunityList(chatId, 'job');
+    await sendOpportunityList(chatId, 'job', null, false, msg.from.id);
   } catch (err) {
     logger.error('Error in /jobs command: %s', err.stack);
     await bot.sendMessage(chatId, '❌ Failed to retrieve active jobs.');
@@ -470,7 +690,7 @@ bot.onText(/^\/jobs(?:@\w+)?$|^💼 Active Jobs$/, async (msg) => {
 bot.onText(/^\/hackathons(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
-    await sendOpportunityList(chatId, 'hackathon');
+    await sendOpportunityList(chatId, 'hackathon', null, false, msg.from.id);
   } catch (err) {
     logger.error('Error in /hackathons command: %s', err.stack);
     await bot.sendMessage(chatId, '❌ Failed to retrieve active hackathons.');
@@ -481,7 +701,7 @@ bot.onText(/^\/hackathons(?:@\w+)?$/, async (msg) => {
 bot.onText(/^\/competitions(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
-    await sendOpportunityList(chatId, 'competition');
+    await sendOpportunityList(chatId, 'competition', null, false, msg.from.id);
   } catch (err) {
     logger.error('Error in /competitions command: %s', err.stack);
     await bot.sendMessage(chatId, '❌ Failed to retrieve active competitions.');
@@ -492,23 +712,7 @@ bot.onText(/^\/competitions(?:@\w+)?$/, async (msg) => {
 bot.onText(/^\/closed(?:@\w+)?$|^📁 Closed Jobs$/, async (msg) => {
   const chatId = msg.chat.id;
   try {
-    const closedJobs = await Job.find({
-      telegramGroupId: chatId,
-      status: { $in: ['closed', 'archived'] }
-    }).sort({ createdAt: -1 }).limit(10);
-
-    if (closedJobs.length === 0) {
-      return await bot.sendMessage(chatId, '📁 No closed or archived opportunities found.');
-    }
-
-    let response = `📁 <b>Recently Closed/Archived Opportunities:</b>\n\n`;
-    closedJobs.forEach((job, index) => {
-      const meta = getOpportunityMeta(job);
-      response += `${index + 1}. <b>${escapeHTML(job.company)}</b> - ${escapeHTML(job.role)} <i>(${escapeHTML(meta.singular)}, ${escapeHTML(job.status.toUpperCase())})</i>\n`;
-      response += `   🔗 <a href="${escapeHTML(job.applyLink)}">Link</a>\n\n`;
-    });
-
-    await bot.sendMessage(chatId, response, { parse_mode: 'HTML', disable_web_page_preview: true });
+    await sendOpportunityList(chatId, null, null, true, msg.from.id);
   } catch (err) {
     logger.error('Error in /closed command: %s', err.stack);
     await bot.sendMessage(chatId, '❌ Failed to retrieve closed opportunities.');
@@ -525,7 +729,7 @@ bot.onText(/^\/jobstats(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
   }
 
   try {
-    const job = await findJobByRef(chatId, jobRef);
+    const job = await findJobByRef(chatId, jobRef, {}, msg.from.id);
     if (!job) {
       return await bot.sendMessage(chatId, '❌ Opportunity not found. Try running /opportunities to see numbers.');
     }
@@ -536,7 +740,7 @@ bot.onText(/^\/jobstats(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
     const noCount = responses.filter(r => r.response === 'no').length;
 
     // Estimate no response
-    const group = await Group.findOne({ telegramGroupId: chatId });
+    const group = await Group.findOne({ telegramGroupId: job.telegramGroupId });
     const totalMembers = group ? group.members.length : 0;
     const respondedUserIds = new Set(responses.map(r => r.userId));
 
@@ -576,7 +780,7 @@ bot.onText(/^\/pending(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
   }
 
   try {
-    const job = await findJobByRef(chatId, jobRef);
+    const job = await findJobByRef(chatId, jobRef, {}, msg.from.id);
     if (!job) {
       return await bot.sendMessage(chatId, '❌ Opportunity not found.');
     }
@@ -586,7 +790,7 @@ bot.onText(/^\/pending(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
     const votedNoUsernames = responses.filter(r => r.response === 'no').map(r => r.username ? `@${r.username}` : `User(${r.userId})`);
 
     // Get no-response users
-    const group = await Group.findOne({ telegramGroupId: chatId });
+    const group = await Group.findOne({ telegramGroupId: job.telegramGroupId });
     const respondedUserIds = new Set(responses.map(r => r.userId));
     const noResponseUsernames = [];
 
@@ -625,6 +829,10 @@ bot.onText(/^\/settings(?:@\w+)?$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
+  if (chatId > 0) {
+    return await bot.sendMessage(chatId, '⚠️ Group control settings can only be configured inside your group chats.');
+  }
+
   if (!(await checkAdmin(chatId, userId))) {
     return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
   }
@@ -639,7 +847,7 @@ bot.onText(/^\/settings(?:@\w+)?$/, async (msg) => {
           admins: [userId]
         }
       },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     );
 
     await sendSettingsSummary(chatId, group);
@@ -654,6 +862,10 @@ bot.onText(/^\/autopoll(?:@\w+)?(?:\s+(\S+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const enabled = parseToggleValue(match[1]);
+
+  if (chatId > 0) {
+    return await bot.sendMessage(chatId, '⚠️ Group control settings can only be configured inside your group chats.');
+  }
 
   if (!(await checkAdmin(chatId, userId))) {
     return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
@@ -674,7 +886,7 @@ bot.onText(/^\/autopoll(?:@\w+)?(?:\s+(\S+))?$/, async (msg, match) => {
           admins: [userId]
         }
       },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     );
 
     await bot.sendMessage(chatId, `✅ Auto job detection is now <b>${formatSettingState(group.settings.autoPollEnabled)}</b>.`, { parse_mode: 'HTML' });
@@ -689,6 +901,10 @@ bot.onText(/^\/dmreminders(?:@\w+)?(?:\s+(\S+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const enabled = parseToggleValue(match[1]);
+
+  if (chatId > 0) {
+    return await bot.sendMessage(chatId, '⚠️ Group control settings can only be configured inside your group chats.');
+  }
 
   if (!(await checkAdmin(chatId, userId))) {
     return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
@@ -709,7 +925,7 @@ bot.onText(/^\/dmreminders(?:@\w+)?(?:\s+(\S+))?$/, async (msg, match) => {
           admins: [userId]
         }
       },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
+      { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     );
 
     await bot.sendMessage(chatId, `✅ DM reminders are now <b>${formatSettingState(group.settings.dmRemindersEnabled)}</b>.`, { parse_mode: 'HTML' });
@@ -725,24 +941,24 @@ bot.onText(/^\/remindnow(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
   const userId = msg.from.id;
   const jobRef = match[1];
 
-  if (!(await checkAdmin(chatId, userId))) {
-    return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
-  }
-
   if (!jobRef) {
     return await bot.sendMessage(chatId, '⚠️ Please specify a job number or ID. Example: <code>/remindnow 1</code>', { parse_mode: 'HTML' });
   }
 
   try {
-    const job = await findJobByRef(chatId, jobRef, { status: 'active' });
+    const job = await findJobByRef(chatId, jobRef, { status: 'active' }, userId);
     if (!job) {
       return await bot.sendMessage(chatId, '❌ Active opportunity not found. Try running /opportunities to see numbers.');
     }
 
+    if (!(await checkAdmin(chatId, userId, job.telegramGroupId))) {
+      return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
+    }
+
     const meta = getOpportunityMeta(job);
-    const { group, targetUsers } = await getPendingReminderTargets(chatId, job);
+    const { group, targetUsers } = await getPendingReminderTargets(job.telegramGroupId, job);
     if (!group) {
-      return await bot.sendMessage(chatId, '❌ This group is not registered yet. Send a regular message first, then try again.');
+      return await bot.sendMessage(chatId, '❌ This group is not registered yet.');
     }
 
     if (group.settings && group.settings.dmRemindersEnabled === false) {
@@ -780,18 +996,18 @@ bot.onText(/^\/deletejob(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
   const userId = msg.from.id;
   const jobRef = match[1];
 
-  if (!(await checkAdmin(chatId, userId))) {
-    return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
-  }
-
   if (!jobRef) {
     return await bot.sendMessage(chatId, '⚠️ Please specify a job number or ID to delete.');
   }
 
   try {
-    const job = await findJobByRef(chatId, jobRef);
+    const job = await findJobByRef(chatId, jobRef, {}, userId);
     if (!job) {
       return await bot.sendMessage(chatId, '❌ Opportunity not found.');
+    }
+
+    if (!(await checkAdmin(chatId, userId, job.telegramGroupId))) {
+      return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
     }
 
     // Delete job, poll responses and reminders
@@ -813,18 +1029,18 @@ bot.onText(/^\/editdeadline(?:@\w+)?(?:\s+(\S+)\s+(.+))?$/, async (msg, match) =
   const jobRef = match[1];
   const dateStr = match[2];
 
-  if (!(await checkAdmin(chatId, userId))) {
-    return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
-  }
-
   if (!jobRef || !dateStr) {
     return await bot.sendMessage(chatId, '⚠️ Usage: <code>/editdeadline &lt;number/ID&gt; &lt;YYYY-MM-DD HH:MM&gt;</code>', { parse_mode: 'HTML' });
   }
 
   try {
-    const job = await findJobByRef(chatId, jobRef);
+    const job = await findJobByRef(chatId, jobRef, {}, userId);
     if (!job) {
       return await bot.sendMessage(chatId, '❌ Opportunity not found.');
+    }
+
+    if (!(await checkAdmin(chatId, userId, job.telegramGroupId))) {
+      return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
     }
 
     const newDate = new Date(dateStr);
@@ -852,6 +1068,10 @@ bot.onText(/^\/forcepoll(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
   const userId = msg.from.id;
   const jobText = match[1];
 
+  if (chatId > 0) {
+    return await bot.sendMessage(chatId, '⚠️ Opportunities can only be tracked/polled inside group chats.');
+  }
+
   if (!(await checkAdmin(chatId, userId))) {
     return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
   }
@@ -877,20 +1097,36 @@ bot.onText(/^\/forcepoll(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
     });
 
     let webpageContexts = [];
+    let directDetails = null;
+
     if (isBareLink(processedText, resolvedUrls)) {
-      logger.info('Forcepoll text is identified as a bare link. Scraping webpage contents...');
-      const fetchPromises = resolvedUrls.map(async (url) => {
-        const content = await fetchPageContent(url);
-        if (content) {
-          return { url, content };
-        }
-        return null;
-      });
-      const results = await Promise.all(fetchPromises);
-      webpageContexts = results.filter(r => r !== null);
+      if (resolvedUrls.length === 1) {
+        logger.info('Forcepoll text is identified as a single bare link. Attempting direct metadata parse...');
+        directDetails = await parseMetadataDirectly(resolvedUrls[0]);
+      }
+
+      if (directDetails) {
+        logger.info('Direct metadata parse succeeded! Skipping Gemini AI.');
+      } else {
+        logger.info('Forcepoll text is identified as a bare link. Scraping webpage contents...');
+        const fetchPromises = resolvedUrls.map(async (url) => {
+          const content = await fetchPageContent(url);
+          if (content) {
+            return { url, content };
+          }
+          return null;
+        });
+        const results = await Promise.all(fetchPromises);
+        webpageContexts = results.filter(r => r !== null);
+      }
     }
 
-    const jobList = await extractJobDetails(processedText, webpageContexts);
+    let jobList = [];
+    if (directDetails) {
+      jobList = [directDetails];
+    } else {
+      jobList = await extractJobDetails(processedText, webpageContexts);
+    }
 
     if (!jobList || jobList.length === 0) {
       return await bot.editMessageText('❌ Failed to extract any valid opportunity details or find application links in the provided text.', {
@@ -935,6 +1171,9 @@ async function createJobAndPoll(chatId, jobDetails, originalMessageId) {
         reply_to_message_id: originalMessageId
       });
     }
+
+    const lastJob = await Job.findOne({ telegramGroupId: chatId }).sort({ jobIndex: -1 });
+    const nextIndex = lastJob && lastJob.jobIndex ? lastJob.jobIndex + 1 : 1;
 
     const deadlineFormatted = jobDetails.deadline ? new Date(jobDetails.deadline).toLocaleDateString('en-IN', {
       day: 'numeric',
@@ -987,11 +1226,12 @@ ${footerText}`;
       telegramMessageId: descriptionMsg.message_id,
       telegramGroupId: chatId,
       telegramPollId: pollMsg.poll.id,
-      status: 'active'
+      status: 'active',
+      jobIndex: nextIndex
     });
 
     await newJob.save();
-    logger.info('Opportunity successfully created and poll launched: %s - %s', newJob.company, newJob.role);
+    logger.info('Opportunity successfully created and poll launched: %s - %s (Index: %d)', newJob.company, newJob.role, nextIndex);
 
   } catch (err) {
     logger.error('Error creating opportunity and poll: %s', err.stack);
@@ -1008,9 +1248,14 @@ bot.on('message', async (msg) => {
   if (!text) return;
 
   const chatId = msg.chat.id;
+  const isGroupOrChannel = msg.chat.type === 'group' || msg.chat.type === 'supergroup' || msg.chat.type === 'channel';
 
   // Register group/user (works for both groups and private chats now)
   const groupObj = await registerUserAndGroup(msg);
+
+  if (!isGroupOrChannel) {
+    return; // Skip auto opportunity parsing inside private DMs
+  }
 
   // If auto poll is disabled in settings, ignore
   if (groupObj && groupObj.settings && groupObj.settings.autoPollEnabled === false) {
@@ -1059,24 +1304,41 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    // Process with AI (conditionally scraping webpage contents)
+    // Attempt direct metadata parsing first to avoid calling Gemini
     let webpageContexts = [];
+    let directDetails = null;
+
     if (isBareLink(processedText, resolvedUrls)) {
-      logger.info('Message is identified as a bare link. Scraping webpage contents...');
-      const fetchPromises = resolvedUrls.map(async (url) => {
-        const content = await fetchPageContent(url);
-        if (content) {
-          return { url, content };
-        }
-        return null;
-      });
-      const results = await Promise.all(fetchPromises);
-      webpageContexts = results.filter(r => r !== null);
+      if (resolvedUrls.length === 1) {
+        logger.info('Message identified as a single bare link. Attempting direct metadata parse...');
+        directDetails = await parseMetadataDirectly(resolvedUrls[0]);
+      }
+
+      if (directDetails) {
+        logger.info('Direct metadata parsing succeeded! Skipping Gemini AI: %o', directDetails);
+      } else {
+        logger.info('Direct metadata parsing failed or not confident. Scraping webpage contents...');
+        const fetchPromises = resolvedUrls.map(async (url) => {
+          const content = await fetchPageContent(url);
+          if (content) {
+            return { url, content };
+          }
+          return null;
+        });
+        const results = await Promise.all(fetchPromises);
+        webpageContexts = results.filter(r => r !== null);
+      }
     } else {
       logger.info('Message has sufficient context. Skipping webpage scraping.');
     }
 
-    const jobList = await extractJobDetails(processedText, webpageContexts);
+    let jobList = [];
+    if (directDetails) {
+      jobList = [directDetails];
+    } else {
+      jobList = await extractJobDetails(processedText, webpageContexts);
+    }
+
     if (jobList && jobList.length > 0) {
       for (const jobDetails of jobList) {
         await createJobAndPoll(chatId, jobDetails, msg.message_id);
@@ -1101,20 +1363,39 @@ bot.on('poll_answer', async (answer) => {
     const firstName = answer.user.first_name || '';
     const lastName = answer.user.last_name || '';
 
-    // Register this user as member of the group
-    const group = await Group.findOne({ telegramGroupId: job.telegramGroupId });
-    if (group) {
-      const exists = group.members.some(m => m.userId === userId);
-      if (!exists) {
-        group.members.push({ userId, username, firstName, lastName });
-        await group.save();
-      } else {
-        const member = group.members.find(m => m.userId === userId);
-        if (member.username !== username) {
-          member.username = username;
-          await group.save();
+    // Register this user as member of the group atomically
+    const updated = await Group.findOneAndUpdate(
+      { 
+        telegramGroupId: job.telegramGroupId, 
+        'members.userId': userId 
+      },
+      { 
+        $set: { 
+          'members.$.username': username,
+          'members.$.firstName': firstName,
+          'members.$.lastName': lastName
+        } 
+      },
+      { returnDocument: 'after' }
+    );
+
+    if (!updated) {
+      await Group.findOneAndUpdate(
+        { 
+          telegramGroupId: job.telegramGroupId,
+          'members.userId': { $ne: userId } 
+        },
+        {
+          $push: {
+            members: {
+              userId: userId,
+              username: username,
+              firstName: firstName,
+              lastName: lastName
+            }
+          }
         }
-      }
+      );
     }
 
     if (answer.option_ids.length === 0) {
@@ -1133,7 +1414,7 @@ bot.on('poll_answer', async (answer) => {
           response: vote,
           respondedAt: new Date()
         },
-        { upsert: true, new: true }
+        { upsert: true, returnDocument: 'after' }
       );
 
       // Send instant DM confirmation
@@ -1153,6 +1434,95 @@ bot.on('poll_answer', async (answer) => {
 });
 
 // ----------------------------------------------------
+// INTERACTIVE CALLBACK QUERY ACCESSIBILITY & SECURITY VERIFIER
+// ----------------------------------------------------
+async function getJobAndVerifyAccess(chatId, jobId, userId) {
+  const job = await Job.findById(jobId);
+  if (!job) return null;
+
+  if (chatId > 0) {
+    // DM chat: verify the user is a member of the group where the job belongs
+    const group = await Group.findOne({ telegramGroupId: job.telegramGroupId, 'members.userId': userId });
+    if (!group) return null;
+  } else {
+    // Group chat: verify the job belongs to the current group
+    if (job.telegramGroupId !== chatId) return null;
+  }
+  return job;
+}
+
+// ----------------------------------------------------
+// INTERACTIVE CALLBACK QUERY DETAILS RENDERER
+// ----------------------------------------------------
+async function renderJobDetails(chatId, jobId, optType, isClosed, messageId, callbackQueryId, userId) {
+  const job = await getJobAndVerifyAccess(chatId, jobId, userId);
+  if (!job) {
+    return await bot.answerCallbackQuery(callbackQueryId, { text: '❌ Opportunity not found or access denied.', show_alert: true });
+  }
+
+  const meta = getOpportunityMeta(job);
+  const deadlineStr = job.deadline ? new Date(job.deadline).toLocaleString('en-IN') : 'N/A';
+
+  // Compute responses summary
+  const responses = await PollResponse.find({ jobId: job._id });
+  const yesCount = responses.filter(r => r.response === 'yes').length;
+  const noCount = responses.filter(r => r.response === 'no').length;
+
+  let detailMsg = `${meta.cardIcon} <b>${escapeHTML(meta.singular)} Details:</b> (Permanent ID: #${job.jobIndex})
+
+<b>${escapeHTML(meta.companyLabel)}:</b> ${escapeHTML(job.company)}
+<b>${escapeHTML(meta.roleLabel)}:</b> ${escapeHTML(job.role)}
+`;
+
+  if (job.location) detailMsg += `📍 <b>Location:</b> ${escapeHTML(job.location)}\n`;
+  if (job.salary) detailMsg += `💵 <b>Compensation:</b> ${escapeHTML(job.salary)}\n`;
+  if (job.batchEligibility) detailMsg += `🎓 <b>Eligibility:</b> ${escapeHTML(job.batchEligibility)}\n`;
+  if (job.prize) detailMsg += `🎁 <b>Prize Pool:</b> ${escapeHTML(job.prize)}\n`;
+  if (job.format) detailMsg += `🖥️ <b>Format:</b> ${escapeHTML(job.format)}\n`;
+  if (job.eventDate) {
+    detailMsg += `🗓️ <b>Event Date:</b> ${escapeHTML(new Date(job.eventDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }))}\n`;
+  }
+
+  detailMsg += `📅 <b>${escapeHTML(meta.deadlineLabel)}:</b> ${escapeHTML(deadlineStr)}
+<b>Status:</b> ${escapeHTML(job.status.toUpperCase())}
+
+📊 <b>Responses:</b> ✅ ${yesCount} | ❌ ${noCount}
+
+🔗 <a href="${escapeHTML(job.applyLink)}">${escapeHTML(meta.linkText)}</a>`;
+
+  const isJobActive = job.status === 'active';
+
+  const inlineKeyboard = [
+    [
+      { text: '📊 Stats', callback_data: `stats:${jobId}:${optType}:${isClosed}` },
+      { text: '🚨 Pending', callback_data: `pending:${jobId}:${optType}:${isClosed}` }
+    ],
+    [
+      { text: '⏰ Remind Now', callback_data: `remind:${jobId}:${optType}:${isClosed}` },
+      { text: '📅 Edit Deadline', callback_data: `edit_deadline_prompt:${jobId}:${optType}:${isClosed}` }
+    ],
+    [
+      isJobActive
+        ? { text: '📁 Archive', callback_data: `archive_job:${jobId}:${optType}:${isClosed}` }
+        : { text: '🔓 Reopen', callback_data: `reopen_job:${jobId}:${optType}:${isClosed}` },
+      { text: '🗑️ Delete', callback_data: `delete_prompt:${jobId}:${optType}:${isClosed}` }
+    ],
+    [
+      { text: '⬅️ Back to List', callback_data: `back_to_list:${optType}:${isClosed}` }
+    ]
+  ];
+
+  await bot.editMessageText(detailMsg, {
+    chat_id: chatId,
+    message_id: messageId,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: { inline_keyboard: inlineKeyboard }
+  });
+  await bot.answerCallbackQuery(callbackQueryId);
+}
+
+// ----------------------------------------------------
 // INTERACTIVE CALLBACK QUERY HANDLER (INLINE BUTTON MENUS)
 // ----------------------------------------------------
 bot.on('callback_query', async (callbackQuery) => {
@@ -1166,56 +1536,19 @@ bot.on('callback_query', async (callbackQuery) => {
       const parts = data.split(':');
       const jobId = parts[1];
       const optType = parts[2] || '';
+      const isClosed = parts[3] || '';
 
-      const job = await Job.findById(jobId);
-      if (!job) {
-        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
-      }
-
-      const meta = getOpportunityMeta(job);
-      const deadlineStr = job.deadline ? new Date(job.deadline).toLocaleString('en-IN') : 'N/A';
-
-      const detailMsg = `💼 <b>${escapeHTML(meta.singular)} Details:</b>
-
-<b>${escapeHTML(meta.companyLabel)}:</b> ${escapeHTML(job.company)}
-<b>${escapeHTML(meta.roleLabel)}:</b> ${escapeHTML(job.role)}
-<b>${escapeHTML(meta.deadlineLabel)}:</b> ${escapeHTML(deadlineStr)}
-<b>Status:</b> ${escapeHTML(job.status.toUpperCase())}
-
-🔗 <a href="${escapeHTML(job.applyLink)}">${escapeHTML(meta.linkText)}</a>`;
-
-      const inlineKeyboard = [
-        [
-          { text: '📊 Stats', callback_data: `stats:${jobId}:${optType}` },
-          { text: '🚨 Pending', callback_data: `pending:${jobId}:${optType}` }
-        ],
-        [
-          { text: '⏰ Remind Now', callback_data: `remind:${jobId}:${optType}` },
-          { text: '📅 Edit Deadline', callback_data: `edit_deadline_prompt:${jobId}:${optType}` }
-        ],
-        [
-          { text: '🗑️ Delete', callback_data: `delete_prompt:${jobId}:${optType}` },
-          { text: '⬅️ Back to List', callback_data: `back_to_list:${optType}` }
-        ]
-      ];
-
-      await bot.editMessageText(detailMsg, {
-        chat_id: chatId,
-        message_id: msg.message_id,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        reply_markup: { inline_keyboard: inlineKeyboard }
-      });
-      await bot.answerCallbackQuery(callbackQuery.id);
+      await renderJobDetails(chatId, jobId, optType, isClosed, msg.message_id, callbackQuery.id, userId);
 
     } else if (data.startsWith('stats:')) {
       const parts = data.split(':');
       const jobId = parts[1];
       const optType = parts[2] || '';
+      const isClosed = parts[3] || '';
 
-      const job = await Job.findById(jobId);
+      const job = await getJobAndVerifyAccess(chatId, jobId, userId);
       if (!job) {
-        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found or access denied.', show_alert: true });
       }
 
       const meta = getOpportunityMeta(job);
@@ -1223,7 +1556,7 @@ bot.on('callback_query', async (callbackQuery) => {
       const yesCount = responses.filter(r => r.response === 'yes').length;
       const noCount = responses.filter(r => r.response === 'no').length;
 
-      const group = await Group.findOne({ telegramGroupId: chatId });
+      const group = await Group.findOne({ telegramGroupId: job.telegramGroupId });
       const totalMembers = group ? group.members.length : 0;
       const respondedUserIds = new Set(responses.map(r => r.userId));
       const noResponseCount = Math.max(0, totalMembers - respondedUserIds.size);
@@ -1245,7 +1578,7 @@ bot.on('callback_query', async (callbackQuery) => {
 🔗 <a href="${escapeHTML(job.applyLink)}">${escapeHTML(meta.linkText)}</a>`;
 
       const inlineKeyboard = [
-        [{ text: '⬅️ Back to Details', callback_data: `view_job:${jobId}:${optType}` }]
+        [{ text: '⬅️ Back to Details', callback_data: `view_job:${jobId}:${optType}:${isClosed}` }]
       ];
 
       await bot.editMessageText(statsMsg, {
@@ -1261,17 +1594,18 @@ bot.on('callback_query', async (callbackQuery) => {
       const parts = data.split(':');
       const jobId = parts[1];
       const optType = parts[2] || '';
+      const isClosed = parts[3] || '';
 
-      const job = await Job.findById(jobId);
+      const job = await getJobAndVerifyAccess(chatId, jobId, userId);
       if (!job) {
-        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found or access denied.', show_alert: true });
       }
 
       const meta = getOpportunityMeta(job);
       const responses = await PollResponse.find({ jobId: job._id });
       const votedNoUsernames = responses.filter(r => r.response === 'no').map(r => r.username ? `@${r.username}` : `User(${r.userId})`);
 
-      const group = await Group.findOne({ telegramGroupId: chatId });
+      const group = await Group.findOne({ telegramGroupId: job.telegramGroupId });
       const respondedUserIds = new Set(responses.map(r => r.userId));
       const noResponseUsernames = [];
 
@@ -1295,7 +1629,7 @@ ${votedNoUsernames.length > 0 ? escapeHTML(votedNoUsernames.join('\n')) : '<i>No
 ${noResponseUsernames.length > 0 ? escapeHTML(noResponseUsernames.join('\n')) : '<i>None</i>'}`;
 
       const inlineKeyboard = [
-        [{ text: '⬅️ Back to Details', callback_data: `view_job:${jobId}:${optType}` }]
+        [{ text: '⬅️ Back to Details', callback_data: `view_job:${jobId}:${optType}:${isClosed}` }]
       ];
 
       await bot.editMessageText(pendingMsg, {
@@ -1310,21 +1644,21 @@ ${noResponseUsernames.length > 0 ? escapeHTML(noResponseUsernames.join('\n')) : 
       const parts = data.split(':');
       const jobId = parts[1];
 
+      const job = await getJobAndVerifyAccess(chatId, jobId, userId);
+      if (!job || job.status !== 'active') {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Active opportunity not found or access denied.', show_alert: true });
+      }
+
       // Admin verification
-      if (!(await checkAdmin(chatId, userId))) {
+      if (!(await checkAdmin(chatId, userId, job.telegramGroupId))) {
         return await bot.answerCallbackQuery(callbackQuery.id, {
           text: '⛔ Only group administrators can perform this action.',
           show_alert: true
         });
       }
 
-      const job = await Job.findOne({ _id: jobId, status: 'active' });
-      if (!job) {
-        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Active opportunity not found.', show_alert: true });
-      }
-
       const meta = getOpportunityMeta(job);
-      const { group, targetUsers } = await getPendingReminderTargets(chatId, job);
+      const { group, targetUsers } = await getPendingReminderTargets(job.telegramGroupId, job);
       if (!group) {
         return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Group is not registered.', show_alert: true });
       }
@@ -1367,18 +1701,19 @@ ${noResponseUsernames.length > 0 ? escapeHTML(noResponseUsernames.join('\n')) : 
       const parts = data.split(':');
       const jobId = parts[1];
       const optType = parts[2] || '';
+      const isClosed = parts[3] || '';
+
+      const job = await getJobAndVerifyAccess(chatId, jobId, userId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found or access denied.', show_alert: true });
+      }
 
       // Admin verification
-      if (!(await checkAdmin(chatId, userId))) {
+      if (!(await checkAdmin(chatId, userId, job.telegramGroupId))) {
         return await bot.answerCallbackQuery(callbackQuery.id, {
           text: '⛔ Only group administrators can perform this action.',
           show_alert: true
         });
-      }
-
-      const job = await Job.findById(jobId);
-      if (!job) {
-        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
       }
 
       const confirmMsg = `⚠️ <b>Confirm Deletion</b>
@@ -1391,7 +1726,7 @@ This will permanently delete the opportunity, its response stats, and all pendin
       const inlineKeyboard = [
         [
           { text: '🗑️ Confirm Delete', callback_data: `delete_confirm:${jobId}:${optType}` },
-          { text: '❌ Cancel', callback_data: `view_job:${jobId}:${optType}` }
+          { text: '❌ Cancel', callback_data: `view_job:${jobId}:${optType}:${isClosed}` }
         ]
       ];
 
@@ -1407,17 +1742,17 @@ This will permanently delete the opportunity, its response stats, and all pendin
       const parts = data.split(':');
       const jobId = parts[1];
 
+      const job = await getJobAndVerifyAccess(chatId, jobId, userId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found or access denied.', show_alert: true });
+      }
+
       // Admin verification
-      if (!(await checkAdmin(chatId, userId))) {
+      if (!(await checkAdmin(chatId, userId, job.telegramGroupId))) {
         return await bot.answerCallbackQuery(callbackQuery.id, {
           text: '⛔ Only group administrators can perform this action.',
           show_alert: true
         });
-      }
-
-      const job = await Job.findById(jobId);
-      if (!job) {
-        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
       }
 
       await Job.deleteOne({ _id: job._id });
@@ -1435,18 +1770,19 @@ This will permanently delete the opportunity, its response stats, and all pendin
       const parts = data.split(':');
       const jobId = parts[1];
       const optType = parts[2] || '';
+      const isClosed = parts[3] || '';
+
+      const job = await getJobAndVerifyAccess(chatId, jobId, userId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found or access denied.', show_alert: true });
+      }
 
       // Admin verification
-      if (!(await checkAdmin(chatId, userId))) {
+      if (!(await checkAdmin(chatId, userId, job.telegramGroupId))) {
         return await bot.answerCallbackQuery(callbackQuery.id, {
           text: '⛔ Only group administrators can perform this action.',
           show_alert: true
         });
-      }
-
-      const job = await Job.findById(jobId);
-      if (!job) {
-        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found.', show_alert: true });
       }
 
       const editMsg = `📅 <b>Edit Deadline:</b>
@@ -1458,7 +1794,7 @@ To edit the deadline for <b>${escapeHTML(job.company)} - ${escapeHTML(job.role)}
 <i>Example:</i> <code>/editdeadline ${jobId} 2026-06-20 23:59</code>`;
 
       const inlineKeyboard = [
-        [{ text: '⬅️ Back to Details', callback_data: `view_job:${jobId}:${optType}` }]
+        [{ text: '⬅️ Back to Details', callback_data: `view_job:${jobId}:${optType}:${isClosed}` }]
       ];
 
       await bot.editMessageText(editMsg, {
@@ -1472,9 +1808,92 @@ To edit the deadline for <b>${escapeHTML(job.company)} - ${escapeHTML(job.role)}
     } else if (data.startsWith('back_to_list:')) {
       const parts = data.split(':');
       const optType = parts[1] || null;
+      const isClosedFlag = parts[2] === '1';
 
-      await sendOpportunityList(chatId, optType, msg.message_id);
+      await sendOpportunityList(chatId, optType, msg.message_id, isClosedFlag, userId);
       await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data === 'toggle_autopoll' || data === 'toggle_dmreminders') {
+      // Admin verification
+      if (!(await checkAdmin(chatId, userId))) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⛔ Only group administrators can perform this action.',
+          show_alert: true
+        });
+      }
+
+      const field = data === 'toggle_autopoll' ? 'settings.autoPollEnabled' : 'settings.dmRemindersEnabled';
+      const group = await Group.findOne({ telegramGroupId: chatId });
+      if (!group) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Group settings not found.', show_alert: true });
+      }
+
+      const currentVal = data === 'toggle_autopoll'
+        ? (group.settings && group.settings.autoPollEnabled !== false)
+        : (group.settings && group.settings.dmRemindersEnabled !== false);
+
+      const updateQuery = {
+        $set: { [field]: !currentVal }
+      };
+
+      const updatedGroup = await Group.findOneAndUpdate(
+        { telegramGroupId: chatId },
+        updateQuery,
+        { returnDocument: 'after' }
+      );
+
+      await bot.answerCallbackQuery(callbackQuery.id, { text: '⚙️ Setting updated successfully!' });
+      await sendSettingsSummary(chatId, updatedGroup, msg.message_id);
+
+    } else if (data.startsWith('archive_job:')) {
+      const parts = data.split(':');
+      const jobId = parts[1];
+      const optType = parts[2] || '';
+      const isClosed = parts[3] || '';
+
+      const job = await getJobAndVerifyAccess(chatId, jobId, userId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found or access denied.', show_alert: true });
+      }
+
+      // Admin verification
+      if (!(await checkAdmin(chatId, userId, job.telegramGroupId))) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⛔ Only group administrators can perform this action.',
+          show_alert: true
+        });
+      }
+
+      job.status = 'archived';
+      await job.save();
+
+      await bot.answerCallbackQuery(callbackQuery.id, { text: '✅ Opportunity archived successfully.' });
+      await renderJobDetails(chatId, jobId, optType, isClosed, msg.message_id, callbackQuery.id, userId);
+
+    } else if (data.startsWith('reopen_job:')) {
+      const parts = data.split(':');
+      const jobId = parts[1];
+      const optType = parts[2] || '';
+      const isClosed = parts[3] || '';
+
+      const job = await getJobAndVerifyAccess(chatId, jobId, userId);
+      if (!job) {
+        return await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Opportunity not found or access denied.', show_alert: true });
+      }
+
+      // Admin verification
+      if (!(await checkAdmin(chatId, userId, job.telegramGroupId))) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⛔ Only group administrators can perform this action.',
+          show_alert: true
+        });
+      }
+
+      job.status = 'active';
+      await job.save();
+
+      await bot.answerCallbackQuery(callbackQuery.id, { text: '✅ Opportunity reopened.' });
+      await renderJobDetails(chatId, jobId, optType, isClosed, msg.message_id, callbackQuery.id, userId);
     }
   } catch (err) {
     logger.error('Error in callback query handler: %s', err.stack);
