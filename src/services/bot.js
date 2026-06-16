@@ -380,7 +380,6 @@ bot.onText(/^\/help(?:@\w+)?$|^❓ Get Help$/, async (msg) => {
 • /autopoll on|off - Toggle automatic opportunity detection
 • /dmreminders on|off - Toggle deadline/reminder DMs
 • /remindnow &lt;index/ID&gt; - DM pending applicants now
-• /broadcast &lt;message&gt; - Broadcast message to all groups
 
 💡 <i>Note: To receive Direct Message reminders, please start the bot in private chat by clicking <a href="t.me/${botUser.username}">here</a> and sending /start.</i>`;
 
@@ -880,40 +879,6 @@ bot.onText(/^\/forcepoll(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
   } catch (err) {
     logger.error('Error in /forcepoll: %s', err.stack);
     await bot.sendMessage(chatId, '❌ An error occurred while force-creating the poll.');
-  }
-});
-
-// /broadcast
-bot.onText(/^\/broadcast(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const broadcastMsg = match[1];
-
-  if (!(await checkAdmin(chatId, userId))) {
-    return await bot.sendMessage(chatId, '⛔ Only group administrators can use this command.');
-  }
-
-  if (!broadcastMsg) {
-    return await bot.sendMessage(chatId, '⚠️ Please provide a message to broadcast.');
-  }
-
-  try {
-    const groups = await Group.find({});
-    let successCount = 0;
-
-    for (const group of groups) {
-      try {
-        await bot.sendMessage(group.telegramGroupId, `📢 <b>Broadcast Message:</b>\n\n${escapeHTML(broadcastMsg)}`, { parse_mode: 'HTML' });
-        successCount++;
-      } catch (err) {
-        logger.warn('Failed to send broadcast to group %d: %s', group.telegramGroupId, err.message);
-      }
-    }
-
-    await bot.sendMessage(chatId, `✅ Broadcast sent successfully to ${successCount}/${groups.length} groups.`);
-  } catch (err) {
-    logger.error('Error in /broadcast: %s', err.stack);
-    await bot.sendMessage(chatId, '❌ Failed to broadcast message.');
   }
 });
 
