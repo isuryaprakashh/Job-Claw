@@ -52,16 +52,21 @@ if (!token) {
 
 const bot = new TelegramBot(token || 'dummy-token', { polling: true });
 
-// Register slash commands menu globally with Telegram
-bot.setMyCommands([
+// Register slash commands menu globally and for all group chats with Telegram
+const globalCommands = [
   { command: 'menu', description: 'Open the main interactive menu' },
   { command: 'jobs', description: 'Display active opportunities' },
   { command: 'jobstats', description: 'Show application stats for a job' },
   { command: 'pending', description: 'Show users who haven\'t applied' },
   { command: 'closed', description: 'Show archived/closed opportunities' },
   { command: 'help', description: 'Display help message' }
+];
+
+Promise.all([
+  bot.setMyCommands(globalCommands, { scope: { type: 'default' } }),
+  bot.setMyCommands(globalCommands, { scope: { type: 'all_group_chats' } })
 ]).then(() => {
-  logger.info('Telegram Bot commands menu registered successfully.');
+  logger.info('Telegram Bot commands menu registered successfully for default and group scopes.');
 }).catch(err => {
   logger.error('Failed to register Telegram Bot commands menu: %s', err.message);
 });
