@@ -54,6 +54,7 @@ const bot = new TelegramBot(token || 'dummy-token', { polling: true });
 
 // Register slash commands menu globally with Telegram
 bot.setMyCommands([
+  { command: 'menu', description: 'Open the main interactive menu' },
   { command: 'jobs', description: 'Display active opportunities' },
   { command: 'jobstats', description: 'Show application stats for a job' },
   { command: 'pending', description: 'Show users who haven\'t applied' },
@@ -366,6 +367,12 @@ Configure the bot's automation and notification options for this group:
         text: `🔔 DM Reminders: ${dmRemindersActive ? '🟢 ON' : '🔴 OFF'}`,
         callback_data: 'toggle_dmreminders'
       }
+    ],
+    [
+      {
+        text: '⬅️ Back to Menu',
+        callback_data: 'back_to_menu'
+      }
     ]
   ];
 
@@ -575,6 +582,9 @@ async function sendOpportunityList(chatId, opportunityType = null, messageId = n
     inlineKeyboard.push(buttons.slice(i, i + 2));
   }
 
+  // Always append a Back to Menu button
+  inlineKeyboard.push([{ text: '⬅️ Back to Menu', callback_data: 'back_to_menu' }]);
+
   const options = {
     parse_mode: 'HTML',
     disable_web_page_preview: true,
@@ -590,9 +600,51 @@ async function sendOpportunityList(chatId, opportunityType = null, messageId = n
   }
 }
 
+async function sendMainMenu(chatId, messageId = null, userId = null) {
+  const text = `🤖 <b>JobClaw Main Menu</b>\n\nSelect an option below to manage and track opportunities:`;
+  const inlineKeyboard = [
+    [
+      { text: '💼 Active Jobs', callback_data: 'menu_jobs' },
+      { text: '🛠️ Hackathons', callback_data: 'menu_hackathons' }
+    ],
+    [
+      { text: '🏆 Competitions', callback_data: 'menu_competitions' },
+      { text: '📁 Closed Ops', callback_data: 'menu_closed' }
+    ],
+    [
+      { text: '⚙️ Settings', callback_data: 'menu_settings' },
+      { text: '❓ Help', callback_data: 'menu_help' }
+    ]
+  ];
+
+  const options = {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: inlineKeyboard
+    }
+  };
+
+  if (messageId) {
+    await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...options });
+  } else {
+    await bot.sendMessage(chatId, text, options);
+  }
+}
+
 // ----------------------------------------------------
 // COMMAND HANDLERS
 // ----------------------------------------------------
+
+// /menu
+bot.onText(/^\/menu(?:@\w+)?$/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    await sendMainMenu(chatId, null, msg.from.id);
+  } catch (err) {
+    logger.error('Error in /menu command: %s', err.stack);
+    await bot.sendMessage(chatId, '❌ Failed to open main menu.');
+  }
+});
 
 // /help
 bot.onText(/^\/help(?:@\w+)?$|^❓ Get Help$/, async (msg) => {
@@ -655,11 +707,28 @@ To list opportunities in your groups, use the bot commands in your group chats. 
     await registerUserAndGroup(msg);
     const welcomeGroup = `👋 Hello! I am <b>JobClaw</b>, the AI job tracking bot. 
 
-I will track opportunities posted in this group and send deadline alerts! Admin settings can be configured using /settings. Check out available commands using the menu below:`;
+I will track opportunities posted in this group and send deadline alerts! Admin settings can be configured using /settings. Check out available commands and options using the interactive menu below:`;
+
+    const inlineKeyboard = [
+      [
+        { text: '💼 Active Jobs', callback_data: 'menu_jobs' },
+        { text: '🛠️ Hackathons', callback_data: 'menu_hackathons' }
+      ],
+      [
+        { text: '🏆 Competitions', callback_data: 'menu_competitions' },
+        { text: '📁 Closed Opportunities', callback_data: 'menu_closed' }
+      ],
+      [
+        { text: '⚙️ Settings', callback_data: 'menu_settings' },
+        { text: '❓ Help', callback_data: 'menu_help' }
+      ]
+    ];
 
     await bot.sendMessage(chatId, welcomeGroup, {
       parse_mode: 'HTML',
-      reply_markup: keyboard
+      reply_markup: {
+        inline_keyboard: inlineKeyboard
+      }
     });
   }
 });
@@ -1532,7 +1601,87 @@ bot.on('callback_query', async (callbackQuery) => {
   const chatId = msg.chat.id;
 
   try {
-    if (data.startsWith('view_job:')) {
+    if (data === 'back_to_menu') {
+      await sendMainMenu(chatId, msg.message_id, userId);
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data === 'menu_jobs') {
+      await sendOpportunityList(chatId, 'job', msg.message_id, false, userId);
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data === 'menu_hackathons') {
+      await sendOpportunityList(chatId, 'hackathon', msg.message_id, false, userId);
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data === 'menu_competitions') {
+      await sendOpportunityList(chatId, 'competition', msg.message_id, false, userId);
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data === 'menu_closed') {
+      await sendOpportunityList(chatId, null, msg.message_id, true, userId);
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data === 'menu_help') {
+      const botUser = await bot.getMe();
+      const helpText = `<b>JobClaw Bot Commands:</b>
+
+👥 <b>Public Commands:</b>
+• /opportunities - Display all active opportunities
+• /jobs - Display active jobs and internships
+• /hackathons - Display active hackathons
+• /competitions - Display active competitions
+• /jobstats &lt;index/ID&gt; - Show response stats for an opportunity
+• /pending &lt;index/ID&gt; - Show users who haven't applied/registered
+• /closed - Show archived/closed opportunities
+• /help - Display this help message
+
+🔑 <b>Admin Commands:</b>
+• /deletejob &lt;index/ID&gt; - Delete an opportunity
+• /editdeadline &lt;index/ID&gt; &lt;YYYY-MM-DD HH:MM&gt; - Edit opportunity deadline
+• /forcepoll &lt;text&gt; - Manually create a poll from text
+• /settings - View group automation settings
+• /autopoll on|off - Toggle automatic opportunity detection
+• /dmreminders on|off - Toggle deadline/reminder DMs
+• /remindnow &lt;index/ID&gt; - DM pending applicants now
+
+💡 <i>Note: To receive Direct Message reminders, please start the bot in private chat by clicking <a href="t.me/${botUser.username}">here</a> and sending /start.</i>`;
+
+      const inlineKeyboard = [
+        [{ text: '⬅️ Back to Menu', callback_data: 'back_to_menu' }]
+      ];
+      await bot.editMessageText(helpText, {
+        chat_id: chatId,
+        message_id: msg.message_id,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: inlineKeyboard }
+      });
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data === 'menu_settings') {
+      if (chatId > 0) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⚠️ Group control settings can only be configured inside group chats.',
+          show_alert: true
+        });
+      }
+      if (!(await checkAdmin(chatId, userId))) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '⛔ Only group administrators can configure settings.',
+          show_alert: true
+        });
+      }
+      const groupObj = await Group.findOne({ telegramGroupId: chatId });
+      if (!groupObj) {
+        return await bot.answerCallbackQuery(callbackQuery.id, {
+          text: '❌ Group settings not found.',
+          show_alert: true
+        });
+      }
+      await sendSettingsSummary(chatId, groupObj, msg.message_id);
+      await bot.answerCallbackQuery(callbackQuery.id);
+
+    } else if (data.startsWith('view_job:')) {
       const parts = data.split(':');
       const jobId = parts[1];
       const optType = parts[2] || '';
