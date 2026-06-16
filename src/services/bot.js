@@ -538,10 +538,20 @@ async function sendOpportunityList(chatId, opportunityType = null, messageId = n
     const emptyLabel = opportunityType ? getOpportunityMeta({ opportunityType }).plural.toLowerCase() : 'opportunities';
     const statusText = isClosed ? 'closed/archived' : 'active';
     const emptyText = `📝 No ${statusText} ${emptyLabel} being tracked right now.`;
+    
+    const options = {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '⬅️ Back to Menu', callback_data: 'back_to_menu' }]
+        ]
+      }
+    };
+
     if (messageId) {
-      return await bot.editMessageText(emptyText, { chat_id: chatId, message_id: messageId });
+      return await bot.editMessageText(emptyText, { chat_id: chatId, message_id: messageId, ...options });
     } else {
-      return await bot.sendMessage(chatId, emptyText);
+      return await bot.sendMessage(chatId, emptyText, options);
     }
   }
 
